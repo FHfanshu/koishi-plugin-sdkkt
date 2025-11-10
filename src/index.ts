@@ -1,17 +1,22 @@
 import { Context, Schema, h, Session, Next } from 'koishi'
 import { PNG } from 'pngjs'
 import axios from 'axios'
+import ExifReader from 'exifreader'
 
 export const name = 'sdexif'
 
 export interface Config {
   useForward: boolean
+  enableDebugLog: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
   useForward: Schema.boolean()
     .default(false)
-    .description('是否使用合并转发格式发送消息')
+    .description('是否使用合并转发格式发送消息'),
+  enableDebugLog: Schema.boolean()
+    .default(false)
+    .description('是否启用调试日志（用于排查图片接收问题）')
 })
 
 interface SDMetadata {
@@ -27,6 +32,8 @@ interface SDMetadata {
 }
 
 export function apply(ctx: Context, config: Config) {
+  const logger = ctx.logger('sdexif')
+  
   ctx.command('sdexif', '读取图片中的 Stable Diffusion 信息')
     .alias('读图')
     .action(async ({ session }) => {
@@ -36,34 +43,95 @@ export function apply(ctx: Context, config: Config) {
     })
 
   ctx.middleware(async (session: Session, next: Next) => {
+    // 调试日志：记录收到的消息
+    if (config.enableDebugLog) {
+      logger.info('收到消息:', {
+        platform: session.platform,
+        channelId: session.channelId,
+        userId: session.userId,
+        content: session.content,
+        elementsCount: session.elements?.length || 0
+      })
+    }
+    
     // 检查消息中是否包含图片
     const imageElements = (session.elements || []).filter((el: h) => el.type === 'img' || el.type === 'image')
     
+    // 调试日志：记录元素详情
+    if (config.enableDebugLog) {
+      logger.info('消息元素分析:', {
+        totalElements: session.elements?.length || 0,
+        imageElements: imageElements.length,
+        elementTypes: (session.elements || []).map(el => el.type),
+        imageElementDetails: imageElements.map(el => ({
+          type: el.type,
+          attrs: el.attrs
+        }))
+      })
+    }
+    
     if (imageElements.length === 0) {
+      if (config.enableDebugLog) {
+        logger.info('未检测到图片元素，跳过处理')
+      }
       return next()
     }
 
     // 检查消息是否包含 sdexif 指令
     const text = session.content || ''
     if (!text.includes('sdexif') && !text.includes('读图')) {
+      if (config.enableDebugLog) {
+        logger.info('消息不包含 sdexif 或读图指令，跳过处理')
+      }
       return next()
+    }
+    
+    if (config.enableDebugLog) {
+      logger.info(`检测到 ${imageElements.length} 个图片元素，开始处理`)
     }
 
     // 处理每个图片
     const results: SDMetadata[] = []
     
-    for (const imgEl of imageElements) {
+    for (let i = 0; i < imageElements.length; i++) {
+      const imgEl = imageElements[i]
       const url = imgEl.attrs?.src || imgEl.attrs?.url
       
-      if (!url) continue
+      if (config.enableDebugLog) {
+        logger.info(`处理第 ${i + 1} 个图片:`, {
+          type: imgEl.type,
+          url: url,
+          allAttrs: imgEl.attrs
+        })
+      }
+      
+      if (!url) {
+        if (config.enableDebugLog) {
+          logger.warn(`第 ${i + 1} 个图片未找到 URL`)
+        }
+        continue
+      }
 
       try {
-        const metadata = await extractSDMetadata(url)
+        if (config.enableDebugLog) {
+          logger.info(`开始下载图片: ${url}`)
+        }
+        const metadata = await extractSDMetadata(url, config.enableDebugLog, logger)
         if (metadata) {
+          if (config.enableDebugLog) {
+            logger.info(`成功提取元数据:`, metadata)
+          }
           results.push(metadata)
+        } else {
+          if (config.enableDebugLog) {
+            logger.info(`图片中未找到 SD 元数据`)
+          }
         }
       } catch (error: any) {
-        ctx.logger('sdexif').warn(`解析图片失败: ${error?.message || error}`)
+        logger.warn(`解析图片失败: ${error?.message || error}`)
+        if (config.enableDebugLog) {
+          logger.error('详细错误信息:', error)
+        }
       }
     }
 
@@ -76,9 +144,13 @@ export function apply(ctx: Context, config: Config) {
   })
 }
 
-async function extractSDMetadata(url: string): Promise<SDMetadata | null> {
+async function extractSDMetadata(url: string, debug: boolean = false, logger?: any): Promise<SDMetadata | null> {
   try {
     // 下载图片
+    if (debug && logger) {
+      logger.info(`发起 HTTP 请求: ${url}`)
+    }
+    
     const response = await axios.get(url, {
       responseType: 'arraybuffer',
       timeout: 30000,
@@ -87,20 +159,41 @@ async function extractSDMetadata(url: string): Promise<SDMetadata | null> {
       }
     })
 
+    if (debug && logger) {
+      logger.info('图片下载成功:', {
+        status: response.status,
+        contentType: response.headers['content-type'],
+        contentLength: response.headers['content-length'],
+        dataSize: response.data.byteLength || response.data.length
+      })
+    }
+
     const buffer = Buffer.from(response.data)
 
-    // 检查是否为 PNG 图片
-    if (!isPNG(buffer)) {
+    // 检测图片格式
+    const format = detectImageFormat(buffer)
+    
+    if (debug && logger) {
+      logger.info(`检测到图片格式: ${format}`)
+    }
+
+    if (!format) {
+      if (debug && logger) {
+        logger.info('不支持的图片格式')
+      }
       return null
     }
 
-    // 解析 PNG
-    const png = PNG.sync.read(buffer)
     const metadata: SDMetadata = {}
 
-    // 读取 text chunks
-    if ((png as any).text) {
-      const textChunks = (png as any).text
+    // 根据格式解析元数据
+    if (format === 'png') {
+      // 解析 PNG
+      const png = PNG.sync.read(buffer)
+      
+      // 读取 text chunks
+      if ((png as any).text) {
+        const textChunks = (png as any).text
 
       // 检查常见的 SD 元数据字段
       if (textChunks.parameters) {
@@ -144,9 +237,83 @@ async function extractSDMetadata(url: string): Promise<SDMetadata | null> {
         }
       }
     }
+    } else if (format === 'webp' || format === 'jpeg') {
+      // 使用 ExifReader 解析 WebP 和 JPEG
+      try {
+        const tags = ExifReader.load(buffer, { expanded: true })
+        
+        if (debug && logger) {
+          logger.info('ExifReader 解析结果:', {
+            hasExif: !!tags.exif,
+            hasXmp: !!tags.xmp,
+            hasIptc: !!tags.iptc,
+            hasIcc: !!tags.icc
+          })
+        }
+
+        // 尝试从 EXIF UserComment 中提取 SD 参数
+        if (tags.exif?.UserComment) {
+          const userCommentTag = tags.exif.UserComment as any
+          const userComment = userCommentTag.description || userCommentTag.value
+          if (userComment && typeof userComment === 'string') {
+            if (debug && logger) {
+              logger.info('找到 UserComment:', userComment)
+            }
+            metadata.parameters = userComment
+            parseA1111Parameters(userComment, metadata)
+          }
+        }
+
+        // 尝试从 ImageDescription 提取
+        if (tags.exif?.ImageDescription) {
+          const descTag = tags.exif.ImageDescription as any
+          const description = descTag.description || descTag.value
+          if (description && typeof description === 'string') {
+            if (debug && logger) {
+              logger.info('找到 ImageDescription:', description)
+            }
+            if (!metadata.parameters) {
+              metadata.parameters = description
+              parseA1111Parameters(description, metadata)
+            }
+          }
+        }
+
+        // 尝试从 XMP 中提取（某些工具会将参数存储在 XMP 中）
+        if (tags.xmp) {
+          if (debug && logger) {
+            logger.info('找到 XMP 数据')
+          }
+          // XMP 数据通常包含在 description 或其他字段中
+          const xmpData = JSON.stringify(tags.xmp)
+          if (xmpData.includes('parameters') || xmpData.includes('prompt')) {
+            // 尝试提取相关信息
+            try {
+              const xmpDesc = (tags.xmp as any).description
+              if (xmpDesc) {
+                const descValue = typeof xmpDesc === 'string' ? xmpDesc : (xmpDesc.value || xmpDesc.description)
+                if (descValue && typeof descValue === 'string') {
+                  metadata.parameters = descValue
+                  parseA1111Parameters(descValue, metadata)
+                }
+              }
+            } catch (e) {
+              // 忽略解析错误
+            }
+          }
+        }
+      } catch (exifError: any) {
+        if (debug && logger) {
+          logger.warn('ExifReader 解析失败:', exifError.message)
+        }
+      }
+    }
 
     // 检查是否有任何元数据
     if (Object.keys(metadata).length === 0) {
+      if (debug && logger) {
+        logger.info('未找到任何 SD 元数据')
+      }
       return null
     }
 
@@ -156,12 +323,26 @@ async function extractSDMetadata(url: string): Promise<SDMetadata | null> {
   }
 }
 
-function isPNG(buffer: Buffer): boolean {
-  return buffer.length >= 8 && 
-         buffer[0] === 0x89 && 
-         buffer[1] === 0x50 && 
-         buffer[2] === 0x4E && 
-         buffer[3] === 0x47
+function detectImageFormat(buffer: Buffer): 'png' | 'webp' | 'jpeg' | null {
+  if (buffer.length < 12) return null
+
+  // PNG: 89 50 4E 47
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+    return 'png'
+  }
+
+  // JPEG: FF D8 FF
+  if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) {
+    return 'jpeg'
+  }
+
+  // WebP: RIFF ... WEBP
+  if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+      buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) {
+    return 'webp'
+  }
+
+  return null
 }
 
 function parseA1111Parameters(parameters: string, metadata: SDMetadata) {

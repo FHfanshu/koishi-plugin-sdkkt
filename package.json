@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-sdexif",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Read EXIF and prompt information from Stable Diffusion generated images",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
@@ -21,7 +21,8 @@
   },
   "dependencies": {
     "pngjs": "^7.0.0",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "exifreader": "^4.23.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
