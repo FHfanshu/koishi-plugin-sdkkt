@@ -4,12 +4,14 @@ import axios from 'axios'
 import ExifReader from 'exifreader'
 import { promises as fs } from 'fs'
 import path from 'path'
+import { gunzipSync, inflateSync } from 'zlib'
 
 export const name = 'sdexif'
 
 export interface Config {
   useForward: boolean
   enableDebugLog: boolean
+  privateOnly: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -18,7 +20,10 @@ export const Config: Schema<Config> = Schema.object({
     .description('是否使用合并转发格式发送消息'),
   enableDebugLog: Schema.boolean()
     .default(false)
-    .description('是否启用调试日志（用于排查图片接收问题）')
+    .description('是否启用调试日志（用于排查图片接收问题）'),
+  privateOnly: Schema.boolean()
+    .default(false)
+    .description('是否仅在私聊中启用')
 })
 
 interface SDMetadata {
@@ -49,142 +54,139 @@ interface FetchImageResult {
 
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('sdexif')
-  
+
   ctx.command('sdexif', '读取图片中的 Stable Diffusion 信息')
     .alias('读图')
     .action(async ({ session }) => {
       if (!session) return '无法获取会话信息'
-      
-      return '请发送要读取的图片'
-    })
 
-  ctx.middleware(async (session: Session, next: Next) => {
-    // 调试日志：记录收到的消息
-    if (config.enableDebugLog) {
-      logger.info('收到消息:', {
-        platform: session.platform,
-        channelId: session.channelId,
-        userId: session.userId,
-        content: session.content,
-        elementsCount: session.elements?.length || 0
-      })
-    }
-    
-    // 检查消息中是否包含图片
-    const imageSegments = collectImageSegments(session)
-
-    // 调试日志：记录元素详情
-    if (config.enableDebugLog) {
-      logger.info('消息元素分析:', {
-        totalElements: session.elements?.length || 0,
-        imageElements: imageSegments.length,
-        elementTypes: (session.elements || []).map((el: any) => el.type),
-        imageElementDetails: imageSegments.map(el => ({
-          type: el.type,
-          attrs: el.attrs,
-          data: el.data,
-          source: el._source
-        }))
-      })
-    }
-
-    if (imageSegments.length === 0) {
-      if (config.enableDebugLog) {
-        logger.info('未检测到图片元素，跳过处理')
+      // 检查是否仅在私聊中启用
+      if (config.privateOnly && !session.isDirect) {
+        return
       }
-      return next()
-    }
-    
-    if (config.enableDebugLog) {
-      logger.info(`检测到 ${imageSegments.length} 个图片元素，开始处理`)
-    }
-
-    // 处理每个图片
-    const results: SDMetadata[] = []
-
-    for (let i = 0; i < imageSegments.length; i++) {
-      const segment = imageSegments[i]
-      const attrs = mergeSegmentAttributes(segment)
 
       if (config.enableDebugLog) {
-        logger.info(`处理第 ${i + 1} 个图片:`, {
-          type: segment.type,
-          attrs,
-          source: segment._source
+        logger.info('收到 sdexif 命令:', {
+          platform: session.platform,
+          channelId: session.channelId,
+          userId: session.userId,
+          content: session.content,
+          elementsCount: session.elements?.length || 0
         })
       }
 
-      try {
-        const fetchResult = await fetchImageBuffer(ctx, session, segment, config.enableDebugLog, logger)
-        let metadata: SDMetadata | null = null
+      const segments = collectImageSegments(session)
 
-        if (fetchResult) {
-          if (config.enableDebugLog) {
-            logger.info('成功获取图片数据', {
-              source: fetchResult.source,
-              sourceType: fetchResult.sourceType,
-              size: fetchResult.buffer.length
-            })
-          }
-          metadata = await extractSDMetadata(fetchResult.buffer, config.enableDebugLog, logger)
-        } else {
-          const directUrl = typeof attrs.src === 'string' ? attrs.src : typeof attrs.url === 'string' ? attrs.url : ''
+      if (segments.length === 0) {
+        return '请在发送命令的同时附带图片，或引用回复包含图片的消息'
+      }
 
-          if (!directUrl) {
-            if (config.enableDebugLog) {
-              logger.warn(`第 ${i + 1} 个图片未找到可用的 URL 或数据`)
-            }
-            continue
-          }
+      if (config.enableDebugLog) {
+        logger.info(`检测到 ${segments.length} 个图片元素，开始处理`)
+      }
 
-          if (config.enableDebugLog) {
-            logger.info(`尝试使用直接 URL 下载图片: ${directUrl}`)
-          }
+      const response = await processImageSegments(ctx, session, segments, config, logger)
+      return response
+    })
+}
 
-          metadata = await extractSDMetadata(directUrl, config.enableDebugLog, logger)
-        }
+async function processImageSegments(ctx: Context, session: Session, imageSegments: ImageSegment[], config: Config, logger: any): Promise<string | h[] | void> {
+  if (config.enableDebugLog) {
+    logger.info('消息元素分析:', {
+      totalElements: session.elements?.length || 0,
+      imageElements: imageSegments.length,
+      elementTypes: (session.elements || []).map((el: any) => el.type),
+      imageElementDetails: imageSegments.map(el => ({
+        type: el.type,
+        attrs: el.attrs,
+        data: el.data,
+        source: el._source
+      }))
+    })
+  }
 
-        if (metadata) {
-          if (config.enableDebugLog) {
-            logger.info(`成功提取元数据:`, metadata)
-          }
-          results.push(metadata)
-        } else {
-          if (config.enableDebugLog) {
-            logger.info(`图片中未找到 SD 元数据`)
-          }
-        }
-      } catch (error: any) {
-        logger.warn(`解析图片失败: ${error?.message || error}`)
+  const results: SDMetadata[] = []
+
+  for (let i = 0; i < imageSegments.length; i++) {
+    const segment = imageSegments[i]
+    const attrs = mergeSegmentAttributes(segment)
+
+    if (config.enableDebugLog) {
+      logger.info(`处理第 ${i + 1} 个图片:`, {
+        type: segment.type,
+        attrs,
+        source: segment._source
+      })
+    }
+
+    try {
+      const fetchResult = await fetchImageBuffer(ctx, session, segment, config.enableDebugLog, logger)
+      let metadata: SDMetadata | null = null
+
+      if (fetchResult) {
         if (config.enableDebugLog) {
-          logger.error('详细错误信息:', error)
+          logger.info('成功获取图片数据', {
+            source: fetchResult.source,
+            sourceType: fetchResult.sourceType,
+            size: fetchResult.buffer.length
+          })
         }
+        metadata = await extractSDMetadata(fetchResult.buffer, config.enableDebugLog, logger)
+      } else {
+        const directUrl = typeof attrs.src === 'string' ? attrs.src : typeof attrs.url === 'string' ? attrs.url : ''
+
+        if (!directUrl) {
+          if (config.enableDebugLog) {
+            logger.warn(`第 ${i + 1} 个图片未找到可用的 URL 或数据`)
+          }
+          continue
+        }
+
+        if (config.enableDebugLog) {
+          logger.info(`尝试使用直接 URL 下载图片: ${directUrl}`)
+        }
+
+        metadata = await extractSDMetadata(directUrl, config.enableDebugLog, logger)
+      }
+
+      if (metadata) {
+        if (config.enableDebugLog) {
+          logger.info('成功提取元数据:', metadata)
+        }
+        results.push(metadata)
+      } else if (config.enableDebugLog) {
+        logger.info('图片中未找到 SD 元数据')
+      }
+    } catch (error: any) {
+      logger.warn(`解析图片失败: ${error?.message || error}`)
+      if (config.enableDebugLog) {
+        logger.error('详细错误信息:', error)
+      }
+    }
+  }
+
+  if (results.length === 0) {
+    return '未能从图片中读取到 Stable Diffusion 信息'
+  }
+
+  const messages = buildMetadataMessages(results)
+
+  if (config.useForward) {
+    if (session.platform === 'onebot') {
+      const sent = await trySendOneBotForward(session, messages, config.enableDebugLog, logger)
+      if (sent) {
+        return
+      }
+
+      if (config.enableDebugLog) {
+        logger.warn('OneBot 合并转发发送失败，将使用默认格式发送')
       }
     }
 
-    if (results.length === 0) {
-      return '未能从图片中读取到 Stable Diffusion 信息'
-    }
+    return formatOutput(session, messages, true)
+  }
 
-    const messages = buildMetadataMessages(results)
-
-    if (config.useForward) {
-      if (session.platform === 'onebot') {
-        const sent = await trySendOneBotForward(session, messages, config.enableDebugLog, logger)
-        if (sent) {
-          return
-        }
-
-        if (config.enableDebugLog) {
-          logger.warn('OneBot 合并转发发送失败，将使用默认格式发送')
-        }
-      }
-
-      return formatOutput(session, messages, true)
-    }
-
-    return formatOutput(session, messages, false)
-  })
+  return formatOutput(session, messages, false)
 }
 
 function collectImageSegments(session: Session): ImageSegment[] {
@@ -206,17 +208,39 @@ function collectImageSegments(session: Session): ImageSegment[] {
     })
   }
 
+  const traverse = (raw: any, origin: string) => {
+    if (!raw) return
+    if (Array.isArray(raw)) {
+      raw.forEach((child, idx) => traverse(child, `${origin}[${idx}]`))
+      return
+    }
+    if (raw && Array.isArray(raw.children)) {
+      raw.children.forEach((child: any, idx: number) => traverse(child, `${origin}.children[${idx}]`))
+    }
+    append(raw, origin)
+  }
+
   const elements = session.elements || []
-  elements.forEach((el: any, index: number) => append(el, `session.elements[${index}]`))
+  elements.forEach((el: any, index: number) => traverse(el, `session.elements[${index}]`))
 
   const quotedElements = session.quote?.elements || []
-  quotedElements.forEach((el: any, index: number) => append(el, `session.quote.elements[${index}]`))
+  quotedElements.forEach((el: any, index: number) => traverse(el, `session.quote.elements[${index}]`))
+
+  const quotedMessage = Array.isArray((session.quote as any)?.message) ? (session.quote as any).message : []
+  quotedMessage.forEach((el: any, index: number) => traverse(el, `session.quote.message[${index}]`))
+
+  const quoteContent = (session.quote as any)?.content
+  if (typeof quoteContent === 'string') {
+    const parsed = h.parse(quoteContent) as any
+    const arr = Array.isArray(parsed) ? parsed : [parsed]
+    arr.forEach((el: any, index: number) => traverse(el, `session.quote.content[${index}]`))
+  }
 
   const eventMessage = Array.isArray((session.event as any)?.message) ? (session.event as any).message : []
   eventMessage.forEach((seg: any, index: number) => {
     if (!seg) return
     const attrs = seg.attrs ?? seg.data
-    append(
+    traverse(
       {
         ...seg,
         attrs,
@@ -467,45 +491,118 @@ async function extractSDMetadata(source: string | Buffer | ArrayBuffer, debug: b
     const metadata: SDMetadata = {}
 
     if (format === 'png') {
-      const png = PNG.sync.read(buffer)
+      // 1. 首先尝试从 PNG chunks 手动提取文本元数据
+      const textChunks = extractPngTextChunks(buffer, debug, logger)
+      
+      if (debug && logger) {
+        logger.info('PNG text chunks:', Object.keys(textChunks))
+      }
 
-      if ((png as any).text) {
-        const textChunks = (png as any).text
-
-        if (textChunks.parameters) {
-          metadata.parameters = textChunks.parameters
-          parseA1111Parameters(textChunks.parameters, metadata)
-        } else if (textChunks.prompt) {
+      // A1111 标准格式
+      if (textChunks.parameters) {
+        if (debug && logger) {
+          logger.info('找到 parameters 字段')
+        }
+        metadata.parameters = textChunks.parameters
+        parseA1111Parameters(textChunks.parameters, metadata)
+      } else if (textChunks.prompt) {
+        // ComfyUI 可能将 prompt 作为 JSON 存储
+        try {
+          const promptData = JSON.parse(textChunks.prompt)
+          if (debug && logger) {
+            logger.info('检测到 ComfyUI 格式（JSON prompt）')
+          }
+          extractComfyUIMetadata(null, promptData, metadata)
+        } catch {
+          // 不是 JSON，作为普通 prompt 处理
           metadata.prompt = textChunks.prompt
         }
+      }
 
-        if (textChunks.Description) {
-          metadata.prompt = textChunks.Description
+      // NovelAI 格式检测
+      if (textChunks.Software === 'NovelAI' || textChunks.software === 'NovelAI') {
+        if (debug && logger) {
+          logger.info('检测到 NovelAI 格式图片')
         }
-        if (textChunks.Comment) {
-          try {
-            const comment = JSON.parse(textChunks.Comment)
-            if (comment.prompt) metadata.prompt = comment.prompt
-            if (comment.uc) metadata.negativePrompt = comment.uc
-            if (comment.steps) metadata.steps = String(comment.steps)
-            if (comment.scale) metadata.cfgScale = String(comment.scale)
-            if (comment.seed) metadata.seed = String(comment.seed)
-            if (comment.sampler) metadata.sampler = comment.sampler
-          } catch {
-            // 忽略 JSON 解析错误
+        try {
+          const description = textChunks.Description || textChunks.description
+          const comment = textChunks.Comment || textChunks.comment
+          
+          if (comment) {
+            const commentData = JSON.parse(comment)
+            if (description) metadata.prompt = description
+            if (commentData.uc) metadata.negativePrompt = commentData.uc
+            if (commentData.steps) metadata.steps = String(commentData.steps)
+            if (commentData.scale) metadata.cfgScale = String(commentData.scale)
+            if (commentData.seed) metadata.seed = String(commentData.seed)
+            if (commentData.sampler) metadata.sampler = commentData.sampler
+            
+            if (debug && logger) {
+              logger.info('成功解析 NovelAI 元数据')
+            }
+          }
+        } catch (error: any) {
+          if (debug && logger) {
+            logger.warn('NovelAI 格式解析失败:', error.message)
           }
         }
+      }
 
-        if (textChunks.workflow || textChunks.prompt) {
-          try {
-            const workflow = textChunks.workflow ? JSON.parse(textChunks.workflow) : null
-            const prompt = textChunks.prompt ? JSON.parse(textChunks.prompt) : null
+      // 其他常见字段
+      if (textChunks.Description && !metadata.prompt) {
+        metadata.prompt = textChunks.Description
+      }
+      if (textChunks.Comment && !metadata.parameters) {
+        try {
+          const comment = JSON.parse(textChunks.Comment)
+          if (comment.prompt) metadata.prompt = comment.prompt
+          if (comment.uc) metadata.negativePrompt = comment.uc
+          if (comment.steps) metadata.steps = String(comment.steps)
+          if (comment.scale) metadata.cfgScale = String(comment.scale)
+          if (comment.seed) metadata.seed = String(comment.seed)
+          if (comment.sampler) metadata.sampler = comment.sampler
+        } catch {
+          // 如果不是 JSON，可能是纯文本参数
+          if (textChunks.Comment.includes('Steps:')) {
+            metadata.parameters = textChunks.Comment
+            parseA1111Parameters(textChunks.Comment, metadata)
+          }
+        }
+      }
 
-            if (workflow || prompt) {
-              extractComfyUIMetadata(workflow, prompt, metadata)
+      // ComfyUI 格式
+      if (textChunks.workflow) {
+        try {
+          const workflow = JSON.parse(textChunks.workflow)
+          if (debug && logger) {
+            logger.info('检测到 ComfyUI 格式（workflow）')
+          }
+          extractComfyUIMetadata(workflow, null, metadata)
+        } catch (error: any) {
+          if (debug && logger) {
+            logger.warn('ComfyUI 格式解析失败:', error.message)
+          }
+        }
+      }
+
+      // 2. 如果仍未找到元数据，尝试提取 Stealth PNG 元数据（LSB 隐写术）
+      if (Object.keys(metadata).length === 0 || !metadata.parameters) {
+        if (debug && logger) {
+          logger.info('尝试提取 Stealth PNG 元数据（LSB 隐写术）')
+        }
+        try {
+          const png = PNG.sync.read(buffer)
+          const stealthMetadata = extractStealthPngMetadata(png, debug, logger)
+          if (stealthMetadata) {
+            if (debug && logger) {
+              logger.info('成功提取 Stealth PNG 元数据')
             }
-          } catch {
-            // 忽略解析错误
+            // 合并 stealth 元数据
+            Object.assign(metadata, stealthMetadata)
+          }
+        } catch (error: any) {
+          if (debug && logger) {
+            logger.warn('Stealth PNG 元数据提取失败:', error.message)
           }
         }
       }
@@ -518,59 +615,149 @@ async function extractSDMetadata(source: string | Buffer | ArrayBuffer, debug: b
             hasExif: !!tags.exif,
             hasXmp: !!tags.xmp,
             hasIptc: !!tags.iptc,
-            hasIcc: !!tags.icc
+            hasIcc: !!tags.icc,
+            hasFile: !!tags.file
           })
         }
 
-        if (tags.exif?.UserComment) {
-          const userCommentTag = tags.exif.UserComment as any
-          const userComment = userCommentTag.description || userCommentTag.value
-          if (userComment && typeof userComment === 'string') {
-            if (debug && logger) {
-              logger.info('找到 UserComment:', userComment)
+        // 尝试多个可能包含元数据的字段
+        const exifFields = [
+          'UserComment',
+          'ImageDescription',
+          'ImageComment',
+          'XPComment',
+          'XPKeywords',
+          'Artist',
+          'Copyright',
+          'Software'
+        ]
+
+        for (const fieldName of exifFields) {
+          if (metadata.parameters) break // 如果已经找到，跳出循环
+
+          const field = (tags.exif as any)?.[fieldName]
+          if (field) {
+            const fieldTag = field as any
+            const fieldValue = fieldTag.description || fieldTag.value
+            if (fieldValue && typeof fieldValue === 'string') {
+              if (debug && logger) {
+                logger.info(`找到 ${fieldName}:`, fieldValue.substring(0, 100))
+              }
+              
+              // 检查是否包含 SD 参数特征
+              if (fieldValue.includes('Steps:') || fieldValue.includes('Sampler:') || 
+                  fieldValue.includes('CFG scale:') || fieldValue.includes('Seed:')) {
+                metadata.parameters = fieldValue
+                parseA1111Parameters(fieldValue, metadata)
+                if (debug && logger) {
+                  logger.info(`从 ${fieldName} 成功解析 SD 参数`)
+                }
+                break
+              }
             }
-            metadata.parameters = userComment
-            parseA1111Parameters(userComment, metadata)
           }
         }
 
-        if (tags.exif?.ImageDescription) {
-          const descTag = tags.exif.ImageDescription as any
-          const description = descTag.description || descTag.value
-          if (description && typeof description === 'string') {
+        // NovelAI 格式检测（JPEG/WebP）
+        if (tags.exif?.Software) {
+          const softwareTag = tags.exif.Software as any
+          const software = softwareTag.description || softwareTag.value
+          if (software === 'NovelAI') {
             if (debug && logger) {
-              logger.info('找到 ImageDescription:', description)
+              logger.info('检测到 NovelAI 格式图片（JPEG/WebP）')
             }
-            if (!metadata.parameters) {
-              metadata.parameters = description
-              parseA1111Parameters(description, metadata)
-            }
-          }
-        }
-
-        if (tags.xmp) {
-          if (debug && logger) {
-            logger.info('找到 XMP 数据')
-          }
-          const xmpData = JSON.stringify(tags.xmp)
-          if (xmpData.includes('parameters') || xmpData.includes('prompt')) {
             try {
-              const xmpDesc = (tags.xmp as any).description
-              if (xmpDesc) {
-                const descValue = typeof xmpDesc === 'string' ? xmpDesc : (xmpDesc.value || xmpDesc.description)
-                if (descValue && typeof descValue === 'string') {
-                  metadata.parameters = descValue
-                  parseA1111Parameters(descValue, metadata)
+              // NovelAI 在 JPEG 中使用 ImageDescription 和 UserComment
+              const descField = tags.exif?.ImageDescription as any
+              const description = descField?.description || descField?.value
+              
+              const commentField = tags.exif?.UserComment as any
+              const comment = commentField?.description || commentField?.value
+              
+              if (comment) {
+                const commentData = JSON.parse(comment)
+                if (description) metadata.prompt = description
+                if (commentData.uc) metadata.negativePrompt = commentData.uc
+                if (commentData.steps) metadata.steps = String(commentData.steps)
+                if (commentData.scale) metadata.cfgScale = String(commentData.scale)
+                if (commentData.seed) metadata.seed = String(commentData.seed)
+                if (commentData.sampler) metadata.sampler = commentData.sampler
+                
+                if (debug && logger) {
+                  logger.info('成功解析 NovelAI JPEG/WebP 元数据')
                 }
               }
-            } catch {
-              // 忽略解析错误
+            } catch (error: any) {
+              if (debug && logger) {
+                logger.warn('NovelAI JPEG/WebP 格式解析失败:', error.message)
+              }
+            }
+          }
+        }
+
+        // XMP 数据解析
+        if (tags.xmp && !metadata.parameters) {
+          if (debug && logger) {
+            logger.info('找到 XMP 数据，尝试解析')
+          }
+          try {
+            const xmpData = JSON.stringify(tags.xmp)
+            if (debug && logger) {
+              logger.info('XMP 数据内容:', xmpData.substring(0, 200))
+            }
+            
+            if (xmpData.includes('parameters') || xmpData.includes('prompt')) {
+              // 尝试多个可能的 XMP 字段
+              const xmpFields = ['description', 'Description', 'dc:description', 'tiff:ImageDescription']
+              for (const xmpField of xmpFields) {
+                const xmpDesc = (tags.xmp as any)[xmpField]
+                if (xmpDesc) {
+                  const descValue = typeof xmpDesc === 'string' ? xmpDesc : (xmpDesc.value || xmpDesc.description)
+                  if (descValue && typeof descValue === 'string') {
+                    if (debug && logger) {
+                      logger.info(`从 XMP.${xmpField} 找到元数据`)
+                    }
+                    metadata.parameters = descValue
+                    parseA1111Parameters(descValue, metadata)
+                    break
+                  }
+                }
+              }
+            }
+          } catch (error: any) {
+            if (debug && logger) {
+              logger.warn('XMP 解析失败:', error.message)
+            }
+          }
+        }
+
+        // IPTC 数据解析
+        if (tags.iptc && !metadata.parameters) {
+          if (debug && logger) {
+            logger.info('找到 IPTC 数据，尝试解析')
+          }
+          try {
+            const iptcCaption = (tags.iptc as any)['Caption/Abstract']
+            if (iptcCaption) {
+              const captionValue = typeof iptcCaption === 'string' ? iptcCaption : (iptcCaption.value || iptcCaption.description)
+              if (captionValue && typeof captionValue === 'string') {
+                if (debug && logger) {
+                  logger.info('从 IPTC Caption 找到元数据')
+                }
+                metadata.parameters = captionValue
+                parseA1111Parameters(captionValue, metadata)
+              }
+            }
+          } catch (error: any) {
+            if (debug && logger) {
+              logger.warn('IPTC 解析失败:', error.message)
             }
           }
         }
       } catch (exifError: any) {
         if (debug && logger) {
           logger.warn('ExifReader 解析失败:', exifError.message)
+          logger.warn('错误堆栈:', exifError.stack)
         }
       }
     }
@@ -582,9 +769,287 @@ async function extractSDMetadata(source: string | Buffer | ArrayBuffer, debug: b
       return null
     }
 
+    if (debug && logger) {
+      logger.info('成功提取元数据:', {
+        hasPrompt: !!metadata.prompt,
+        hasNegativePrompt: !!metadata.negativePrompt,
+        hasParameters: !!metadata.parameters,
+        hasSteps: !!metadata.steps,
+        hasSampler: !!metadata.sampler
+      })
+    }
+
     return metadata
-  } catch (error) {
+  } catch (error: any) {
+    if (debug && logger) {
+      logger.error('元数据提取过程发生错误:', error.message)
+      logger.error('错误堆栈:', error.stack)
+    }
     throw error
+  }
+}
+
+/**
+ * 手动解析 PNG 文件中的文本块（tEXt、iTXt、zTXt）
+ * pngjs 库默认不解析这些块，需要手动提取
+ */
+function extractPngTextChunks(buffer: Buffer, debug: boolean = false, logger?: any): Record<string, string> {
+  const textChunks: Record<string, string> = {}
+  
+  try {
+    // PNG 文件结构：8字节签名 + 多个 chunk
+    // 每个 chunk 格式：4字节长度 + 4字节类型 + 数据 + 4字节CRC
+    let offset = 8 // 跳过 PNG 签名
+    
+    while (offset < buffer.length - 12) {
+      // 读取 chunk 长度（大端序）
+      const length = buffer.readUInt32BE(offset)
+      offset += 4
+      
+      // 读取 chunk 类型（4个ASCII字符）
+      const type = buffer.toString('ascii', offset, offset + 4)
+      offset += 4
+      
+      // 读取 chunk 数据
+      const chunkData = buffer.slice(offset, offset + length)
+      offset += length
+      
+      // 跳过 CRC
+      offset += 4
+      
+      // 处理不同类型的文本块
+      if (type === 'tEXt') {
+        // tEXt: 关键字\0文本（都是Latin-1编码）
+        const nullIndex = chunkData.indexOf(0)
+        if (nullIndex !== -1) {
+          const keyword = chunkData.toString('latin1', 0, nullIndex)
+          const text = chunkData.toString('utf8', nullIndex + 1)
+          textChunks[keyword] = text
+          
+          if (debug && logger) {
+            logger.info(`找到 tEXt chunk: ${keyword} (${text.length} bytes)`)
+          }
+        }
+      } else if (type === 'iTXt') {
+        // iTXt: 关键字\0压缩标志\0压缩方法\0语言标签\0翻译关键字\0文本
+        const nullIndex = chunkData.indexOf(0)
+        if (nullIndex !== -1) {
+          const keyword = chunkData.toString('latin1', 0, nullIndex)
+          const compressionFlag = chunkData[nullIndex + 1]
+          const compressionMethod = chunkData[nullIndex + 2]
+          
+          // 查找语言标签后的 null
+          let pos = nullIndex + 3
+          const langEnd = chunkData.indexOf(0, pos)
+          if (langEnd !== -1) {
+            // 查找翻译关键字后的 null
+            pos = langEnd + 1
+            const transEnd = chunkData.indexOf(0, pos)
+            if (transEnd !== -1) {
+              pos = transEnd + 1
+              let text: string
+              
+              if (compressionFlag === 1 && compressionMethod === 0) {
+                // 压缩文本，需要解压
+                try {
+                  const compressed = chunkData.slice(pos)
+                  const decompressed = gunzipSync(compressed)
+                  text = decompressed.toString('utf8')
+                } catch {
+                  text = chunkData.toString('utf8', pos)
+                }
+              } else {
+                // 未压缩文本
+                text = chunkData.toString('utf8', pos)
+              }
+              
+              textChunks[keyword] = text
+              
+              if (debug && logger) {
+                logger.info(`找到 iTXt chunk: ${keyword} (${text.length} bytes, compressed: ${compressionFlag === 1})`)
+              }
+            }
+          }
+        }
+      } else if (type === 'zTXt') {
+        // zTXt: 关键字\0压缩方法\0压缩文本
+        const nullIndex = chunkData.indexOf(0)
+        if (nullIndex !== -1) {
+          const keyword = chunkData.toString('latin1', 0, nullIndex)
+          const compressionMethod = chunkData[nullIndex + 1]
+          
+          if (compressionMethod === 0) {
+            // zlib 压缩
+            try {
+              const compressed = chunkData.slice(nullIndex + 2)
+              const decompressed = inflateSync(compressed)
+              const text = decompressed.toString('utf8')
+              textChunks[keyword] = text
+              
+              if (debug && logger) {
+                logger.info(`找到 zTXt chunk: ${keyword} (${text.length} bytes)`)
+              }
+            } catch (error: any) {
+              if (debug && logger) {
+                logger.warn(`解压 zTXt chunk 失败: ${keyword}`, error.message)
+              }
+            }
+          }
+        }
+      } else if (type === 'IEND') {
+        // 到达文件末尾
+        break
+      }
+    }
+  } catch (error: any) {
+    if (debug && logger) {
+      logger.warn('解析 PNG chunks 失败:', error.message)
+    }
+  }
+  
+  return textChunks
+}
+
+/**
+ * 从 PNG alpha 通道提取通过 LSB 隐写术嵌入的元数据
+ * 这是 Stealth PNG 格式，将元数据隐藏在 alpha 通道的最低有效位中
+ */
+function extractStealthPngMetadata(png: PNG, debug: boolean = false, logger?: any): SDMetadata | null {
+  try {
+    const { width, height, data: pngData } = png
+    
+    if (!pngData || pngData.length === 0) {
+      return null
+    }
+
+    // 提取所有 alpha 通道的 LSB
+    const lowestBits: number[] = []
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * 4
+        const alpha = pngData[idx + 3]
+        lowestBits.push(alpha & 1) // 提取最低位
+      }
+    }
+
+    // 读取 magic number
+    const magic = 'stealth_pngcomp'
+    const reader = new BitReader(lowestBits)
+    const magicBytes = reader.readNBytes(magic.length)
+    const magicString = String.fromCharCode(...magicBytes)
+
+    if (magicString !== magic) {
+      if (debug && logger) {
+        logger.info('未检测到 Stealth PNG magic number')
+      }
+      return null
+    }
+
+    if (debug && logger) {
+      logger.info('检测到 Stealth PNG magic number')
+    }
+
+    // 读取数据长度（32位整数）
+    const dataLength = reader.readInt32()
+    if (debug && logger) {
+      logger.info(`Stealth PNG 数据长度: ${dataLength} bits (${dataLength / 8} bytes)`)
+    }
+
+    if (dataLength <= 0 || dataLength > lowestBits.length * 8) {
+      if (debug && logger) {
+        logger.warn('Stealth PNG 数据长度无效')
+      }
+      return null
+    }
+
+    // 读取 gzip 压缩的数据
+    const gzipData = reader.readNBytes(dataLength / 8)
+    const gzipBuffer = Buffer.from(gzipData)
+    
+    // 解压缩
+    const decompressed = gunzipSync(gzipBuffer)
+    const jsonString = decompressed.toString('utf-8')
+    
+    if (debug && logger) {
+      logger.info('Stealth PNG 解压后的 JSON:', jsonString.substring(0, 200))
+    }
+
+    // 解析 JSON
+    const jsonData = JSON.parse(jsonString) as any
+    
+    // 转换为 SDMetadata 格式
+    const metadata: SDMetadata = {}
+    
+    if (jsonData.prompt) metadata.prompt = jsonData.prompt
+    if (jsonData.negative_prompt) metadata.negativePrompt = jsonData.negative_prompt
+    if (jsonData.steps) metadata.steps = String(jsonData.steps)
+    if (jsonData.sampler) metadata.sampler = jsonData.sampler
+    if (jsonData.cfg_scale) metadata.cfgScale = String(jsonData.cfg_scale)
+    if (jsonData.seed) metadata.seed = String(jsonData.seed)
+    if (jsonData.size) metadata.size = jsonData.size
+    if (jsonData.model) metadata.model = jsonData.model
+    
+    // 如果有完整的参数字符串，也保存
+    if (jsonData.parameters) {
+      metadata.parameters = jsonData.parameters
+    }
+
+    return metadata
+  } catch (error: any) {
+    if (debug && logger) {
+      logger.warn('Stealth PNG 元数据提取失败:', error.message)
+    }
+    return null
+  }
+}
+
+/**
+ * 用于从位数组中读取数据的辅助类
+ */
+class BitReader {
+  private data: number[]
+  private index: number
+
+  constructor(data: number[]) {
+    this.data = data
+    this.index = 0
+  }
+
+  readBit(): number {
+    if (this.index >= this.data.length) {
+      throw new Error('BitReader: 读取超出范围')
+    }
+    return this.data[this.index++]
+  }
+
+  readNBits(n: number): number[] {
+    const bits: number[] = []
+    for (let i = 0; i < n; i++) {
+      bits.push(this.readBit())
+    }
+    return bits
+  }
+
+  readByte(): number {
+    let byte = 0
+    for (let i = 0; i < 8; i++) {
+      byte |= this.readBit() << (7 - i)
+    }
+    return byte
+  }
+
+  readNBytes(n: number): number[] {
+    const bytes: number[] = []
+    for (let i = 0; i < n; i++) {
+      bytes.push(this.readByte())
+    }
+    return bytes
+  }
+
+  readInt32(): number {
+    const bytes = this.readNBytes(4)
+    const buffer = Buffer.from(bytes)
+    return buffer.readInt32BE(0)
   }
 }
 

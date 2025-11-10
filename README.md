@@ -192,6 +192,15 @@ MIT License
 
 ## 更新日志
 
+### 1.1.1 (2025-11-10)
+
+- 🔧 **[重要修复]** 修复 PNG 元数据读取问题
+  - 实现手动 PNG chunks 解析（tEXt、iTXt、zTXt）
+  - 修复 `pngjs` 库默认不解析文本块的问题
+  - 支持更多 AI 图片生成工具的元数据格式
+  - 提升 PNG 图片的元数据提取成功率
+- 📝 详细修复说明请查看 [FIX_NOTES.md](FIX_NOTES.md)
+
 ### 1.1.0
 
 - 🎉 新增多格式图片支持：PNG、WebP、JPEG/JPG
