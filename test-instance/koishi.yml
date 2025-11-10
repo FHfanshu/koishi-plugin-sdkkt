@@ -1,0 +1,13 @@
+plugins:
+  proxy-agent:tyz9n4: {}
+  http:4butg8: {}
+  server:h1u0vd:
+    port: 5140
+    host: 127.0.0.1
+  console:k2vxbg:
+    open: true
+  sandbox:f4fom3:
+    enabled: true
+  sdexif:t8c0uy:
+    useForward: false
+logLevel: 2

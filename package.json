@@ -1,0 +1,34 @@
+{
+  "name": "koishi-plugin-sdexif",
+  "version": "1.0.0",
+  "description": "Read EXIF and prompt information from Stable Diffusion generated images",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin",
+    "stable-diffusion",
+    "exif",
+    "png-info"
+  ],
+  "peerDependencies": {
+    "koishi": "^4.0.0"
+  },
+  "dependencies": {
+    "pngjs": "^7.0.0",
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "koishi": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "scripts": {
+    "build": "tsc"
+  }
+}

@@ -1,0 +1,11 @@
+# Koishi 配置示例
+
+plugins:
+  # 其他插件配置...
+  
+  # SD EXIF 读取插件
+  sdexif:
+    # 是否使用合并转发格式发送消息
+    # false: 普通文本消息（默认）
+    # true: 合并转发格式
+    useForward: false
