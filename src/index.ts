@@ -57,6 +57,8 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.command('sdexif', '读取图片中的 Stable Diffusion 信息')
     .alias('读图')
+    .shortcut('sdexif', { fuzzy: true })
+    .shortcut('读图', { fuzzy: true })
     .action(async ({ session }) => {
       if (!session) return '无法获取会话信息'
 
@@ -75,7 +77,7 @@ export function apply(ctx: Context, config: Config) {
         })
       }
 
-      const segments = collectImageSegments(session)
+      const segments = await collectImageSegments(session, config.enableDebugLog, logger)
 
       if (segments.length === 0) {
         return '请在发送命令的同时附带图片，或引用回复包含图片的消息'
@@ -105,10 +107,16 @@ async function processImageSegments(ctx: Context, session: Session, imageSegment
     })
   }
 
+  // 发送前再次做一道去重，防止不同来源的相同图片重复处理
+  const segmentsToUse = dedupeImageSegments(imageSegments, config.enableDebugLog, logger)
+  if (config.enableDebugLog && segmentsToUse.length !== imageSegments.length) {
+    logger.info(`去重后图片元素数: ${segmentsToUse.length}`)
+  }
+
   const results: SDMetadata[] = []
 
-  for (let i = 0; i < imageSegments.length; i++) {
-    const segment = imageSegments[i]
+  for (let i = 0; i < segmentsToUse.length; i++) {
+    const segment = segmentsToUse[i]
     const attrs = mergeSegmentAttributes(segment)
 
     if (config.enableDebugLog) {
@@ -181,6 +189,8 @@ async function processImageSegments(ctx: Context, session: Session, imageSegment
       if (config.enableDebugLog) {
         logger.warn('OneBot 合并转发发送失败，将使用默认格式发送')
       }
+      // OneBot 转发失败时降级为普通文本，避免客户端异常或重复
+      return formatOutput(session, messages, false)
     }
 
     return formatOutput(session, messages, true)
@@ -189,8 +199,45 @@ async function processImageSegments(ctx: Context, session: Session, imageSegment
   return formatOutput(session, messages, false)
 }
 
-function collectImageSegments(session: Session): ImageSegment[] {
+async function collectImageSegments(session: Session, debug: boolean = false, logger?: any): Promise<ImageSegment[]> {
   const segments: ImageSegment[] = []
+  const seenKeys = new Set<string>()
+  const normalizeUrl = (u?: string): string => {
+    if (!u || typeof u !== 'string') return ''
+    try {
+      const url = new URL(u)
+      // 排序查询参数，去掉无关空值
+      const params = [...url.searchParams.entries()]
+        .filter(([k, v]) => v !== undefined && v !== null)
+        .sort((a, b) => a[0].localeCompare(b[0]))
+      url.search = params.map(([k, v]) => `${k}=${v}`).join('&')
+      return url.toString()
+    } catch {
+      return u
+    }
+  }
+  const makeKey = (raw: any): string => {
+    try {
+      const a = (raw?.attrs && typeof raw.attrs === 'object') ? raw.attrs : {}
+      const d = (raw?.data && typeof raw.data === 'object') ? raw.data : {}
+      const pick = (obj: any, keys: string[]) => keys.map(k => obj?.[k]).find((v) => typeof v === 'string' && v)
+      const id = pick(a, ['file', 'image', 'fileId', 'file_id', 'id']) || pick(d, ['file', 'image', 'fileId', 'file_id', 'id'])
+      const rawUrl = (pick(a, ['url', 'src']) || pick(d, ['url', 'src'])) as string | undefined
+      const url = normalizeUrl(rawUrl)
+      const pathKey = pick(a, ['path', 'localPath']) || pick(d, ['path', 'localPath'])
+      const b64len = typeof a?.base64 === 'string' ? `b64:${a.base64.length}`
+        : typeof a?.image_base64 === 'string' ? `b64:${a.image_base64.length}`
+        : typeof d?.base64 === 'string' ? `b64:${d.base64.length}`
+        : typeof d?.image_base64 === 'string' ? `b64:${d.image_base64.length}`
+        : ''
+      const fileKey = (typeof (a as any)?.file === 'string' ? (a as any).file : '') || (typeof (d as any)?.file === 'string' ? (d as any).file : '')
+      const sizeKey = (typeof (a as any)?.fileSize === 'string' ? (a as any).fileSize : (typeof (a as any)?.size === 'string' ? (a as any).size : '')) || (typeof (d as any)?.fileSize === 'string' ? (d as any).fileSize : (typeof (d as any)?.size === 'string' ? (d as any).size : ''))
+      const fileSig = fileKey || sizeKey ? `file:${fileKey}#${sizeKey}` : ''
+      return id || url || pathKey || fileSig || b64len || ''
+    } catch {
+      return ''
+    }
+  }
   const append = (raw: any, origin: string) => {
     if (!raw) return
     const type = raw.type || 'image'
@@ -198,6 +245,13 @@ function collectImageSegments(session: Session): ImageSegment[] {
 
     const attrs = raw.attrs && typeof raw.attrs === 'object' ? { ...raw.attrs } : undefined
     const data = raw.data && typeof raw.data === 'object' ? { ...raw.data } : undefined
+
+    const key = makeKey({ ...raw, attrs, data })
+    if (key && seenKeys.has(key)) {
+      if (debug && logger) logger.info('去重：忽略重复图片元素', { origin, key })
+      return
+    }
+    if (key) seenKeys.add(key)
 
     segments.push({
       ...(raw as Record<string, any>),
@@ -249,6 +303,41 @@ function collectImageSegments(session: Session): ImageSegment[] {
       `session.event.message[${index}]`
     )
   })
+
+  // 如果仍未获取到引用消息中的图片，尝试通过 bot.getMessage 拉取被引用消息的完整元素
+  const quoteId = (session.quote as any)?.messageId || (session.quote as any)?.id
+  if (quoteId) {
+    const bot: any = session.bot
+    if (bot && typeof bot.getMessage === 'function') {
+      try {
+        if (debug && logger) logger.info('尝试通过 bot.getMessage 获取引用消息', { quoteId, channelId: session.channelId })
+        let quoted: any = null
+        try {
+          // 常见签名：getMessage(channelId, messageId)
+          quoted = await bot.getMessage(session.channelId, quoteId)
+        } catch {}
+        if (!quoted) {
+          try {
+            // 兼容可能的签名：getMessage(messageId)
+            quoted = await bot.getMessage(quoteId)
+          } catch {}
+        }
+        if (quoted) {
+          const elems = Array.isArray(quoted.elements) ? quoted.elements : (Array.isArray(quoted.message) ? quoted.message : [])
+          if (Array.isArray(elems)) {
+            elems.forEach((el: any, index: number) => traverse(el, `bot.getMessage[${index}]`))
+          }
+          if (typeof quoted.content === 'string') {
+            const parsed = h.parse(quoted.content) as any
+            const arr = Array.isArray(parsed) ? parsed : [parsed]
+            arr.forEach((el: any, index: number) => traverse(el, `bot.getMessage.content[${index}]`))
+          }
+        }
+      } catch (e: any) {
+        if (debug && logger) logger.warn('bot.getMessage 获取引用消息失败', { message: e?.message || e })
+      }
+    }
+  }
 
   return segments
 }
@@ -367,6 +456,40 @@ async function tryReadLocalFileBuffer(target: string): Promise<Buffer | null> {
   } catch {
     return null
   }
+}
+
+function dedupeImageSegments(segments: ImageSegment[], debug: boolean = false, logger?: any): ImageSegment[] {
+  const seen = new Set<string>()
+  const normalizeUrl = (u?: string): string => {
+    if (!u || typeof u !== 'string') return ''
+    try {
+      const url = new URL(u)
+      const params = [...url.searchParams.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+      url.search = params.map(([k, v]) => `${k}=${v}`).join('&')
+      return url.toString()
+    } catch {
+      return u
+    }
+  }
+  const makeKey = (seg: ImageSegment): string => {
+    const a = mergeSegmentAttributes(seg)
+    const id = (a.file || a.image || a.fileId || a.file_id || a.id || '') as string
+    const url = normalizeUrl((a.src || a.url) as string)
+    const file = (a.file || '') as string
+    const size = (a.fileSize || a.size || '') as string
+    return id || url || (file || size ? `file:${file}#${size}` : '') || ''
+  }
+  const unique: ImageSegment[] = []
+  for (const seg of segments) {
+    const key = makeKey(seg)
+    if (key && seen.has(key)) {
+      if (debug && logger) logger.info('发送前去重：忽略重复图片', { key, source: seg._source })
+      continue
+    }
+    if (key) seen.add(key)
+    unique.push(seg)
+  }
+  return unique
 }
 
 function normalizeLocalPath(target: string): string | null {
@@ -1208,12 +1331,13 @@ function buildForwardNodes(session: Session, messages: string[]): h[] {
   const selfId = session.bot?.selfId || session.selfId || 'bot'
   const displayName = session.bot?.user?.name || 'Bot'
 
-  return messages.map(msg =>
-    h('message', { forward: true }, [
+  const nodes = messages.map(msg =>
+    h('message', {}, [
       h('author', { id: selfId, name: displayName }),
       h('content', {}, msg)
     ])
   )
+  return [h('message', { forward: true }, nodes)]
 }
 
 async function trySendOneBotForward(session: Session, messages: string[], debug: boolean, logger?: any): Promise<boolean> {
@@ -1235,15 +1359,50 @@ async function trySendOneBotForward(session: Session, messages: string[], debug:
     }
   }))
 
+  const chId = String(session.channelId || '')
+  const isPrivate = !!session.isDirect || chId.startsWith('private:')
+  const stripPrefix = (id?: string | number | null) => {
+    if (id == null) return ''
+    const s = String(id)
+    return s.replace(/^(?:private|group):/i, '')
+  }
+
   try {
-    if (session.guildId || session.channelId) {
-      const targetId = session.channelId || session.guildId
-      if (!targetId) return false
-      await internal.sendGroupForwardMsg(targetId, forwardNodes)
-    } else if (session.userId) {
-      await internal.sendFriendForwardMsg(session.userId, forwardNodes)
-    } else {
+    if (debug && logger) {
+      logger.info('OneBot 合并转发路由判定', {
+        isPrivate,
+        channelId: session.channelId,
+        guildId: (session as any).guildId,
+        userId: session.userId
+      })
+    }
+    const callInternal = async (names: string[], ...args: any[]) => {
+      for (const name of names) {
+        const fn = (internal as any)[name]
+        if (typeof fn === 'function') {
+          if (debug && logger) {
+            logger.info('尝试调用 OneBot internal 方法', { name })
+          }
+          await fn(...args)
+          if (debug && logger) {
+            logger.info('OneBot internal 方法调用成功', { name })
+          }
+          return true
+        }
+      }
       return false
+    }
+
+    if (!isPrivate) {
+      const targetId = stripPrefix((session.guildId as any) || chId)
+      if (!targetId) return false
+      const ok = await callInternal(['sendGroupForwardMsg', 'send_group_forward_msg'], targetId, forwardNodes)
+      if (!ok) return false
+    } else {
+      const friendId = stripPrefix((session.userId as any) || chId)
+      if (!friendId) return false
+      const ok = await callInternal(['sendFriendForwardMsg', 'sendPrivateForwardMsg', 'send_private_forward_msg'], friendId, forwardNodes)
+      if (!ok) return false
     }
 
     if (debug && logger) {
