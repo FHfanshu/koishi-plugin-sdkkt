@@ -1,8 +1,42 @@
+# Dependencies
 node_modules/
+package-lock.json
+
+# Build outputs
 lib/
-*.log
-.DS_Store
-.env
-.vscode/
-*.tsbuildinfo
 dist/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Koishi specific
+data/
+logs/
+koishi.lock.yml
+
+# Test instance
+test-instance/node_modules/
+test-instance/data/
+test-instance/logs/
+test-instance/koishi.lock.yml
