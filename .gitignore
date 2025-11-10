@@ -36,7 +36,4 @@ logs/
 koishi.lock.yml
 
 # Test instance
-test-instance/node_modules/
-test-instance/data/
-test-instance/logs/
-test-instance/koishi.lock.yml
+test-instance/

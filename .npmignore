@@ -1,0 +1,27 @@
+# Source files
+src/
+*.ts
+!*.d.ts
+tsconfig.json
+
+# Development
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Test and example files
+test-instance/
+example/
+
+# Documentation (keep README)
+USAGE.md
+PROJECT_SUMMARY.md
+
+# Logs
+*.log
+
+# Lock files
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
