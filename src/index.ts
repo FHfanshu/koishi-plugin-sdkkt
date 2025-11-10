@@ -12,6 +12,7 @@ export interface Config {
   useForward: boolean
   enableDebugLog: boolean
   privateOnly: boolean
+  groupAutoParseWhitelist: string[]
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -23,7 +24,10 @@ export const Config: Schema<Config> = Schema.object({
     .description('是否启用调试日志（用于排查图片接收问题）'),
   privateOnly: Schema.boolean()
     .default(false)
-    .description('是否仅在私聊中启用')
+    .description('是否仅在私聊中启用'),
+  groupAutoParseWhitelist: Schema.array(Schema.string())
+    .default([])
+    .description('群聊白名单：在这些群聊中自动解析图片（无需命令），为空则禁用')
 })
 
 interface SDMetadata {
@@ -90,6 +94,44 @@ export function apply(ctx: Context, config: Config) {
       const response = await processImageSegments(ctx, session, segments, config, logger)
       return response
     })
+
+  ctx.middleware(async (session, next) => {
+    try {
+      if (config.privateOnly) return next()
+      if (!session || session.isDirect) return next()
+      const whitelist = config.groupAutoParseWhitelist || []
+      if (!Array.isArray(whitelist) || whitelist.length === 0) return next()
+      const chId = String(session.channelId || '')
+      const normalized = chId.replace(/^(?:private|group|guild|channel):/i, '')
+      const inWhitelist = whitelist.includes(chId) || whitelist.includes(normalized)
+      if (!inWhitelist) return next()
+
+      const contentLower = (session.content || '').toLowerCase()
+      if (contentLower.includes('sdexif') || contentLower.includes('读图')) {
+        return next()
+      }
+
+      const segments = await collectImageSegments(session, config.enableDebugLog, logger)
+      if (segments.length === 0) return next()
+
+      const resp = await processImageSegments(ctx, session, segments, config, logger)
+      if (typeof resp === 'string') {
+        if (resp === '未能从图片中读取到 Stable Diffusion 信息') return
+        await session.send(resp)
+        return
+      } else if (Array.isArray(resp)) {
+        await session.send(resp)
+        return
+      } else {
+        return
+      }
+    } catch (e) {
+      if (config.enableDebugLog) {
+        logger.warn('群白名单自动解析处理失败', e)
+      }
+      return next()
+    }
+  })
 }
 
 async function processImageSegments(ctx: Context, session: Session, imageSegments: ImageSegment[], config: Config, logger: any): Promise<string | h[] | void> {
@@ -1383,7 +1425,7 @@ async function trySendOneBotForward(session: Session, messages: string[], debug:
           if (debug && logger) {
             logger.info('尝试调用 OneBot internal 方法', { name })
           }
-          await fn(...args)
+          await fn.apply(internal, args)
           if (debug && logger) {
             logger.info('OneBot internal 方法调用成功', { name })
           }
