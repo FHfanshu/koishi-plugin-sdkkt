@@ -1046,7 +1046,7 @@ function bufferFromBase64(value: string): Buffer | null {
   }
 }
 
-async function extractSDMetadata(source: string | Buffer | ArrayBuffer, debug: boolean = false, logger?: any): Promise<SDMetadata | null> {
+export async function extractSDMetadata(source: string | Buffer | ArrayBuffer, debug: boolean = false, logger?: any): Promise<SDMetadata | null> {
   try {
     let buffer: Buffer
 
@@ -1281,49 +1281,26 @@ async function extractSDMetadata(source: string | Buffer | ArrayBuffer, debug: b
       }
     } else if (format === 'webp' || format === 'jpeg') {
       try {
-        const tags = ExifReader.load(buffer, { expanded: true })
+        // 1. 首先尝试手动解析 JPEG APP 段（仅 JPEG）
+        if (format === 'jpeg') {
+          if (debug && logger) {
+            logger.info('尝试手动解析 JPEG APP 段')
+          }
+          const appSegments = extractJpegAppSegments(buffer, debug, logger)
 
-        if (debug && logger) {
-          logger.info('ExifReader 解析结果:', {
-            hasExif: !!tags.exif,
-            hasXmp: !!tags.xmp,
-            hasIptc: !!tags.iptc,
-            hasIcc: !!tags.icc,
-            hasFile: !!tags.file
-          })
-        }
+          if (Object.keys(appSegments).length > 0) {
+            if (debug && logger) {
+              logger.info('找到 JPEG APP 段:', Object.keys(appSegments))
+            }
 
-        // 尝试多个可能包含元数据的字段
-        const exifFields = [
-          'UserComment',
-          'ImageDescription',
-          'ImageComment',
-          'XPComment',
-          'XPKeywords',
-          'Artist',
-          'Copyright',
-          'Software'
-        ]
-
-        for (const fieldName of exifFields) {
-          if (metadata.parameters) break // 如果已经找到，跳出循环
-
-          const field = (tags.exif as any)?.[fieldName]
-          if (field) {
-            const fieldTag = field as any
-            const fieldValue = fieldTag.description || fieldTag.value
-            if (fieldValue && typeof fieldValue === 'string') {
-              if (debug && logger) {
-                logger.info(`找到 ${fieldName}:`, fieldValue.substring(0, 100))
-              }
-              
-              // 检查是否包含 SD 参数特征
-              if (fieldValue.includes('Steps:') || fieldValue.includes('Sampler:') || 
-                  fieldValue.includes('CFG scale:') || fieldValue.includes('Seed:')) {
-                metadata.parameters = fieldValue
-                parseA1111Parameters(fieldValue, metadata)
+            // 搜索包含 SD 参数的 APP 段
+            for (const [appName, content] of Object.entries(appSegments)) {
+              if (content.includes('Steps:') || content.includes('Sampler:') ||
+                  content.includes('CFG scale:') || content.includes('Seed:')) {
+                metadata.parameters = content
+                parseA1111Parameters(content, metadata)
                 if (debug && logger) {
-                  logger.info(`从 ${fieldName} 成功解析 SD 参数`)
+                  logger.info(`从 ${appName} 成功解析 SD 参数`)
                 }
                 break
               }
@@ -1331,8 +1308,246 @@ async function extractSDMetadata(source: string | Buffer | ArrayBuffer, debug: b
           }
         }
 
-        // NovelAI 格式检测（JPEG/WebP）
-        if (tags.exif?.Software) {
+        // 2. 如果手动解析没有找到，使用 ExifReader 库
+        if (!metadata.parameters) {
+          let tags: any = null
+          try {
+            tags = ExifReader.load(buffer, { expanded: true })
+
+            if (debug && logger) {
+              logger.info('ExifReader 解析结果:', {
+                hasExif: !!tags.exif,
+                hasXmp: !!tags.xmp,
+                hasIptc: !!tags.iptc,
+                hasIcc: !!tags.icc,
+                hasFile: !!tags.file
+              })
+            }
+          } catch (exifError: any) {
+            if (debug && logger) {
+              logger.warn('ExifReader 解析失败:', exifError.message)
+            }
+            // 继续执行，不中断流程
+          }
+
+          // 扩展的 EXIF 字段列表
+          const exifFields = [
+            'UserComment',
+            'ImageDescription',
+            'ImageComment',
+            'XPComment',
+            'XPKeywords',
+            'Artist',
+            'Copyright',
+            'Software',
+            'DocumentName',
+            'PageName',
+            'HostComputer',
+            'Make',
+            'Model'
+          ]
+
+          if (tags) {
+            for (const fieldName of exifFields) {
+              if (metadata.parameters) break // 如果已经找到，跳出循环
+
+              const field = (tags.exif as any)?.[fieldName]
+              if (field) {
+                const fieldTag = field as any
+                const fieldValue = fieldTag.description || fieldTag.value
+                if (fieldValue && typeof fieldValue === 'string') {
+                  if (debug && logger) {
+                    logger.info(`找到 ${fieldName}:`, fieldValue.substring(0, 100))
+                  }
+
+                  // 检查是否包含 SD 参数特征
+                  if (fieldValue.includes('Steps:') || fieldValue.includes('Sampler:') ||
+                      fieldValue.includes('CFG scale:') || fieldValue.includes('Seed:')) {
+                    metadata.parameters = fieldValue
+                    parseA1111Parameters(fieldValue, metadata)
+                    if (debug && logger) {
+                      logger.info(`从 ${fieldName} 成功解析 SD 参数`)
+                    }
+                    break
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // 3. 增强的 WebP 解析（仅 WebP）
+        if (format === 'webp' && !metadata.parameters) {
+          if (debug && logger) {
+            logger.info('尝试增强 WebP 解析')
+          }
+
+          // WebP 格式：RIFF 头 + WEBP 标识 + chunks
+          if (buffer.length >= 12) {
+            const riffHeader = buffer.slice(0, 4).toString()
+            const webpHeader = buffer.slice(8, 12).toString()
+
+            if (riffHeader === 'RIFF' && webpHeader === 'WEBP') {
+              let webpOffset = 12
+
+              while (webpOffset < buffer.length - 8) {
+                // 读取 chunk 四字节标识
+                const chunkFourCC = buffer.slice(webpOffset, webpOffset + 4).toString()
+                webpOffset += 4
+
+                // 读取 chunk 大小（小端序）
+                const chunkSize = buffer.readUInt32LE(webpOffset)
+                webpOffset += 4
+
+                // 确保 chunk 数据完整
+                if (webpOffset + chunkSize > buffer.length) break
+
+                const chunkData = buffer.slice(webpOffset, webpOffset + chunkSize)
+                webpOffset += chunkSize
+
+                // 处理不同类型的 chunks
+                if (chunkFourCC === 'EXIF' || chunkFourCC === 'XMP ') {
+                  try {
+                    // 尝试从 EXIF/XMP chunk 中提取文本
+                    let textContent = ''
+                    const encodings = ['utf8', 'ascii', 'latin1']
+
+                    for (const encoding of encodings) {
+                      try {
+                        const text = chunkData.toString(encoding as BufferEncoding)
+                        if (text.includes('Steps:') || text.includes('Sampler:') ||
+                            text.includes('CFG scale:') || text.includes('Seed:')) {
+                          textContent = text
+                          break
+                        }
+                      } catch {
+                        continue
+                      }
+                    }
+
+                    if (textContent) {
+                      metadata.parameters = textContent
+                      parseA1111Parameters(textContent, metadata)
+                      if (debug && logger) {
+                        logger.info(`从 WebP ${chunkFourCC} chunk 成功解析 SD 参数`)
+                      }
+                      break
+                    }
+                  } catch (error: any) {
+                    if (debug && logger) {
+                      logger.warn(`解析 WebP ${chunkFourCC} chunk 失败:`, error.message)
+                    }
+                  }
+                }
+
+                // 跳过 padding（chunk 大小必须是偶数）
+                if (chunkSize % 2 === 1) {
+                  webpOffset++
+                }
+              }
+            }
+          }
+        }
+
+        // 4. 二进制数据搜索（最后的后备方案）
+        if (!metadata.parameters) {
+          if (debug && logger) {
+            logger.info('尝试二进制数据搜索')
+          }
+
+          const binarySearch = (data: Buffer): string | null => {
+            const minLength = 50 // 最小搜索长度
+            const maxLength = 5000 // 最大搜索长度
+
+            // 搜索常见的 SD 参数模式
+            const patterns = [
+              /Steps:\s*\d+.*?Sampler:\s*[^,\n]+/gi,
+              /CFG\s*scale:\s*[\d.]+.*?Seed:\s*\d+/gi,
+              /Negative\s*prompt:\s*[^\n]+/gi,
+              /"prompt":\s*"[^"]+",\s*"negative_prompt"/gi
+            ]
+
+            // 尝试从整个缓冲区中提取文本
+            for (const encoding of ['utf8', 'latin1', 'ascii']) {
+              try {
+                const text = data.toString(encoding as BufferEncoding)
+
+                for (const pattern of patterns) {
+                  const matches = text.match(pattern)
+                  if (matches && matches.length > 0) {
+                    // 找到匹配后，提取包含完整参数的文本块
+                    const matchIndex = text.indexOf(matches[0])
+                    const startPos = Math.max(0, matchIndex - 100)
+                    const endPos = Math.min(text.length, matchIndex + 1000)
+                    const candidate = text.slice(startPos, endPos)
+
+                    // 验证是否包含完整的 SD 参数
+                    if (candidate.includes('Steps:') && (
+                      candidate.includes('Sampler:') ||
+                      candidate.includes('CFG scale:') ||
+                      candidate.includes('Seed:')
+                    )) {
+                      return candidate
+                    }
+                  }
+                }
+              } catch {
+                continue
+              }
+            }
+
+            // 如果文本搜索失败，尝试在二进制数据中搜索特定的字节模式
+            const binaryPatterns = [
+              Buffer.from('Steps:'), // 常见参数开头
+              Buffer.from('parameters'),
+              Buffer.from('negative_prompt')
+            ]
+
+            for (const pattern of binaryPatterns) {
+              const index = data.indexOf(pattern)
+              if (index !== -1) {
+                // 找到模式后，提取周围的文本
+                const startPos = Math.max(0, index - 200)
+                const endPos = Math.min(data.length, index + 2000)
+                const chunk = data.slice(startPos, endPos)
+
+                for (const encoding of ['utf8', 'latin1', 'ascii']) {
+                  try {
+                    const text = chunk.toString(encoding as BufferEncoding)
+                    if (text.includes('Steps:') && text.length > minLength) {
+                      return text
+                    }
+                  } catch {
+                    continue
+                  }
+                }
+              }
+            }
+
+            return null
+          }
+
+          const foundText = binarySearch(buffer)
+          if (foundText) {
+            metadata.parameters = foundText
+            parseA1111Parameters(foundText, metadata)
+            if (debug && logger) {
+              logger.info('通过二进制搜索成功解析 SD 参数')
+            }
+          }
+        }
+
+        // NovelAI 格式检测（JPEG/WebP） - 需要先获取 tags
+        let tags: any = null
+        try {
+          tags = ExifReader.load(buffer, { expanded: true })
+        } catch (error: any) {
+          if (debug && logger) {
+            logger.warn('ExifReader 加载失败，跳过 NovelAI 检测:', error.message)
+          }
+        }
+
+        if (tags?.exif?.Software) {
           const softwareTag = tags.exif.Software as any
           const software = softwareTag.description || softwareTag.value
           if (software === 'NovelAI') {
@@ -1493,6 +1708,140 @@ async function extractSDMetadata(source: string | Buffer | ArrayBuffer, debug: b
     }
     throw error
   }
+}
+
+/**
+ * 手动解析 JPEG 文件中的 APP 段
+ * 许多 SD 工具将元数据存储在 APP 段中
+ */
+function extractJpegAppSegments(buffer: Buffer, debug: boolean = false, logger?: any): Record<string, string> {
+  const appSegments: Record<string, string> = {}
+
+  try {
+    let offset = 0
+
+    // 检查 JPEG 文件头 (FF D8 FF)
+    if (buffer.length < 3 || buffer[0] !== 0xFF || buffer[1] !== 0xD8 || buffer[2] !== 0xFF) {
+      if (debug && logger) {
+        logger.warn('不是有效的 JPEG 文件')
+      }
+      return appSegments
+    }
+
+    offset = 2
+
+    while (offset < buffer.length - 4) {
+      // 查找下一个段标记 (FF xx)
+      if (buffer[offset] !== 0xFF) {
+        offset++
+        continue
+      }
+
+      const marker = buffer[offset + 1]
+      offset += 2
+
+      // 跳过填充字节 (FF FF)
+      if (marker === 0xFF) {
+        continue
+      }
+
+      // 图像数据开始 (SOS) 或文件结束 (EOI)
+      if (marker === 0xDA || marker === 0xD9) {
+        break
+      }
+
+      // 读取段长度 (大端序，包括长度字段本身)
+      if (offset + 2 > buffer.length) break
+      const segmentLength = buffer.readUInt16BE(offset)
+      offset += 2
+
+      // 确保段数据完整
+      if (offset + segmentLength - 2 > buffer.length) break
+
+      const segmentData = buffer.slice(offset, offset + segmentLength - 2)
+      offset += segmentLength - 2
+
+      // 处理不同类型的 APP 段
+      if (marker >= 0xE0 && marker <= 0xEF) {
+        // APP0-APP15 段
+        const appName = `APP${marker - 0xE0}`
+
+        try {
+          // 尝试解析为文本
+          let textContent = ''
+
+          // 检查是否有 identifiable 文本内容
+          if (segmentData.length > 0) {
+            // 尝试不同的编码方式
+            const encodings = ['utf8', 'ascii', 'latin1']
+
+            for (const encoding of encodings) {
+              try {
+                const text = segmentData.toString(encoding as BufferEncoding)
+                // 检查是否包含可读的文本和 SD 参数特征
+                if (text.includes('Steps:') || text.includes('Sampler:') ||
+                    text.includes('CFG scale:') || text.includes('Seed:') ||
+                    text.includes('prompt') || text.includes('negative_prompt')) {
+                  textContent = text
+                  break
+                }
+              } catch {
+                continue
+              }
+            }
+
+            // 如果没有找到明显的文本内容，检查是否是 EXIF 数据
+            if (!textContent && segmentData.length > 6) {
+              // EXIF 数据通常以 'Exif\0\0' 开头
+              if (segmentData.slice(0, 6).toString() === 'Exif\0\0') {
+                const exifData = segmentData.slice(6)
+                // 尝试从 EXIF 数据中提取文本
+                for (const encoding of ['utf8', 'ascii', 'latin1']) {
+                  try {
+                    const text = exifData.toString(encoding as BufferEncoding)
+                    if (text.includes('Steps:') || text.includes('Sampler:')) {
+                      textContent = text
+                      break
+                    }
+                  } catch {
+                    continue
+                  }
+                }
+              }
+            }
+
+            // 检查 COM (评论) 段
+            if (marker === 0xFE && segmentData.length > 0) {
+              const comText = segmentData.toString('utf8').replace(/\0/g, '')
+              if (comText.includes('Steps:') || comText.includes('Sampler:')) {
+                appSegments['COM'] = comText
+                if (debug && logger) {
+                  logger.info(`找到 COM 段: ${comText.substring(0, 100)}`)
+                }
+              }
+            }
+          }
+
+          if (textContent) {
+            appSegments[appName] = textContent
+            if (debug && logger) {
+              logger.info(`找到 ${appName} 段: ${textContent.substring(0, 100)}`)
+            }
+          }
+        } catch (error: any) {
+          if (debug && logger) {
+            logger.warn(`解析 ${appName} 段失败:`, error.message)
+          }
+        }
+      }
+    }
+  } catch (error: any) {
+    if (debug && logger) {
+      logger.warn('解析 JPEG APP 段失败:', error.message)
+    }
+  }
+
+  return appSegments
 }
 
 /**
