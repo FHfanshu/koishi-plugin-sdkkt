@@ -7,6 +7,7 @@
 ## 功能特性
 
 - 🖼️ 读取 Stable Diffusion 生成图片的元数据
+- 📁 **新增：支持群文件图片自动解析**
 - 📝 支持多种 SD 格式：
   - AUTOMATIC1111 WebUI
   - NovelAI
@@ -36,6 +37,24 @@ pnpm add koishi-plugin-sdkkt
 1. 在 Koishi 中启用本插件
 2. 发送包含 `sdexif` 或 `读图` 指令的消息，并附带图片
 3. Bot 会自动解析并返回图片中的 Stable Diffusion 信息
+
+### 群文件图片自动解析
+
+**新增功能**：当用户在群聊中上传图片文件时，插件可以自动检测并解析，无需发送命令！
+
+#### 配置方法
+在插件配置中添加群白名单：
+```json
+{
+  "groupAutoParseWhitelist": ["123456", "789012"]
+}
+```
+
+#### 使用条件
+- 群聊必须在白名单中
+- 文件大小 ≤ 10MB
+- 支持的图片格式：JPG、PNG、WebP、GIF、BMP、TIFF、HEIC、HEIF
+- 非图片文件自动跳过
 
 ### 示例
 
@@ -73,6 +92,8 @@ Model: AnythingV5
 |--------|------|--------|------|
 | useForward | boolean | false | 是否使用合并转发格式发送消息 |
 | enableDebugLog | boolean | false | 是否启用调试日志（用于排查图片接收问题） |
+| privateOnly | boolean | false | 是否仅在私聊中启用 |
+| groupAutoParseWhitelist | string[] | [] | **新增**：群聊白名单，在这些群聊中自动解析群文件图片（无需命令） |
 
 ### useForward 说明
 
@@ -191,6 +212,23 @@ npm run build
 MIT License
 
 ## 更新日志
+
+### 1.2.0 (2025-11-11)
+
+- 📁 **新增群文件图片自动解析功能**
+  - 支持监听群文件上传事件
+  - 自动检测 10MB 以下的图片文件
+  - 支持的格式：JPG、PNG、WebP、GIF、BMP、TIFF、HEIC、HEIF
+  - 通过 `groupAutoParseWhitelist` 配置启用
+  - 无需发送命令，自动解析并发送结果
+- 🔧 增强文件处理能力
+  - 改进 `collectImageSegments` 函数，支持群文件事件
+  - 增强 `fetchImageBuffer` 函数，支持群文件下载
+  - 集成 OneBot `get_group_file_url` 接口调用
+- 🛡️ 安全限制
+  - 10MB 文件大小限制，防止内存溢出
+  - 非图片文件自动跳过
+  - 完善的错误处理和日志记录
 
 ### 1.1.1 (2025-11-10)
 

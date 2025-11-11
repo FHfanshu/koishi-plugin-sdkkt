@@ -37,3 +37,6 @@ koishi.lock.yml
 
 # Test instance
 test-instance/
+
+# Claude AI
+.claude/

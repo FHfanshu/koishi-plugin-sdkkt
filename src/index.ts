@@ -128,6 +128,8 @@ export function apply(ctx: Context, config: Config) {
       return response
     })
 
+  // 群文件处理功能已集成到 collectImageSegments 和 fetchImageBuffer 函数中
+
   ctx.middleware(async (session, next) => {
     try {
       if (config.privateOnly) return next()
@@ -405,6 +407,58 @@ async function collectImageSegments(session: Session, debug: boolean = false, lo
     )
   })
 
+  // 处理群文件上传事件中的文件
+  const fileEvent = session.event as any
+  if (fileEvent?.file) {
+    const file = fileEvent.file
+    if (debug && logger) {
+      logger.info('检测到群文件事件中的文件', { filename: file.name, size: file.size })
+    }
+
+    // 检查文件大小（10MB限制）
+    const maxSize = 10 * 1024 * 1024 // 10MB
+    if (file.size > maxSize) {
+      if (debug && logger) {
+        logger.info(`群文件过大，跳过处理: ${file.size} > ${maxSize}`)
+      }
+    } else {
+      // 检查是否为图片文件
+      const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.heic', '.heif']
+      const fileExt = path.extname(file.name || '').toLowerCase()
+      const isImage = imageExts.includes(fileExt)
+
+      if (isImage) {
+        if (debug && logger) {
+          logger.info(`检测到群文件图片: ${file.name}`)
+        }
+        // 创建图片段，包含文件信息
+        const imageSegment = {
+          type: 'image',
+          attrs: {
+            file: file.id || file.name,
+            name: file.name,
+            size: file.size,
+            url: file.url || file.path,
+            busid: file.busid
+          },
+          data: {
+            file: file.id || file.name,
+            name: file.name,
+            size: file.size,
+            url: file.url || file.path,
+            busid: file.busid
+          },
+          _source: 'group_file_event'
+        }
+        segments.push(imageSegment)
+      } else {
+        if (debug && logger) {
+          logger.info(`群文件非图片格式，跳过处理: ${file.name}`)
+        }
+      }
+    }
+  }
+
   // 如果仍未获取到引用消息中的图片，尝试通过 bot.getMessage 拉取被引用消息的完整元素
   const quoteId = (session.quote as any)?.messageId || (session.quote as any)?.id
   if (quoteId) {
@@ -575,6 +629,65 @@ async function fetchImageBuffer(ctx: Context, session: Session, segment: ImageSe
     if (botBuffer) {
       logDebug('通过 bot.getFile 获取到图片数据', { identifier: candidate, length: botBuffer.length })
       return { buffer: botBuffer, source: candidate, sourceType: 'bot-file' }
+    }
+  }
+
+  // 处理群文件下载
+  if (attrs.name && attrs.size && attrs.size <= 10 * 1024 * 1024) { // 10MB限制
+    const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.heic', '.heif']
+    const fileExt = path.extname(attrs.name || '').toLowerCase()
+    const isImage = imageExts.includes(fileExt)
+
+    if (isImage) {
+      // 尝试获取群文件下载链接
+      let fileUrl: string | null = null
+      try {
+        const bot: any = session.bot
+        if (bot && bot.internal) {
+          const internal = bot.internal
+          const methods = ['getGroupFileUrl', 'get_group_file_url']
+
+          for (const method of methods) {
+            const fn = internal[method]
+            if (typeof fn === 'function') {
+              if (debug && logger) {
+                logger.info(`尝试调用 ${method} 获取群文件下载链接`, { fileId: attrs.file, channelId: session.channelId })
+              }
+              const result = await fn.call(internal, session.channelId, attrs.file, attrs.busid)
+              if (result && result.url) {
+                fileUrl = result.url
+                if (debug && logger) {
+                  logger.info(`成功获取群文件下载链接: ${fileUrl}`)
+                }
+                break
+              }
+            }
+          }
+        }
+      } catch (error: any) {
+        if (debug && logger) {
+          logger.warn('获取群文件下载链接失败', error.message)
+        }
+      }
+
+      if (fileUrl) {
+        try {
+          const downloaded = await axios.get(fileUrl, {
+            responseType: 'arraybuffer',
+            timeout: 30000,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+          })
+          const buffer = Buffer.from(downloaded.data)
+          logDebug('成功下载群文件图片', { url: fileUrl, size: buffer.length })
+          return { buffer, source: fileUrl, sourceType: 'bot-file' }
+        } catch (error: any) {
+          if (debug && logger) {
+            logger.warn('下载群文件图片失败', { url: fileUrl, message: error.message })
+          }
+        }
+      }
     }
   }
 
