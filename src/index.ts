@@ -15,6 +15,30 @@ export interface Config {
   groupAutoParseWhitelist: string[]
 }
 
+function buildPlainTextChunks(messages: string[]): h[] {
+  const MAX_CHARS = 3000
+  const chunks: h[] = []
+  const sep = '\n\n===\n\n'
+  const expanded: string[] = []
+  for (let i = 0; i < messages.length; i++) {
+    expanded.push(messages[i])
+    if (i !== messages.length - 1) expanded.push(sep)
+  }
+  const text = expanded.join('')
+  let start = 0
+  while (start < text.length) {
+    let end = Math.min(start + MAX_CHARS, text.length)
+    if (end < text.length) {
+      const near = text.lastIndexOf('\n', end - 1)
+      if (near > start + 500) end = near + 1
+    }
+    const slice = text.slice(start, end)
+    chunks.push(h.text(slice))
+    start = end
+  }
+  return chunks
+}
+
 export const Config: Schema<Config> = Schema.object({
   useForward: Schema.boolean()
     .default(false)
@@ -61,6 +85,9 @@ interface FetchImageResult {
   source: string
   sourceType: 'data-uri' | 'base64' | 'local' | 'bot-file'
 }
+
+const CACHE_DIR = path.join(process.cwd(), 'data', 'edexif')
+let cacheDirEnsured = false
 
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('sdexif')
@@ -198,11 +225,24 @@ async function processImageSegments(ctx: Context, session: Session, imageSegment
           continue
         }
 
-        if (config.enableDebugLog) {
-          logger.info(`尝试使用直接 URL 下载图片: ${directUrl}`)
-        }
+        const localDirectBuffer = await tryReadLocalFileBuffer(directUrl)
+        if (localDirectBuffer) {
+          if (config.enableDebugLog) {
+            logger.info('尝试使用本地路径加载图片', { path: directUrl, length: localDirectBuffer.length })
+          }
+          metadata = await extractMetadataWithCache(localDirectBuffer, attrs, config.enableDebugLog, logger, directUrl)
+        } else {
+          if (config.enableDebugLog) {
+            logger.info(`尝试使用直接 URL 下载图片: ${directUrl}`)
+          }
 
-        metadata = await extractSDMetadata(directUrl, config.enableDebugLog, logger)
+          const downloaded = await downloadImageToBuffer(directUrl, config.enableDebugLog, logger)
+          if (downloaded) {
+            metadata = await extractMetadataWithCache(downloaded, attrs, config.enableDebugLog, logger, directUrl)
+          } else {
+            metadata = await extractSDMetadata(directUrl, config.enableDebugLog, logger)
+          }
+        }
       }
 
       if (metadata) {
@@ -398,6 +438,65 @@ async function collectImageSegments(session: Session, debug: boolean = false, lo
         if (debug && logger) logger.warn('bot.getMessage 获取引用消息失败', { message: e?.message || e })
       }
     }
+
+    // Napcat/OneBot: 直接走 internal.get_msg 以拿到原始 segments（包含 image.url/file）
+    if ((session.platform === 'onebot') && bot && bot.internal) {
+      try {
+        const internal: any = bot.internal
+        const methodNames = ['getMsg', 'get_msg']
+        const midRaw = isNaN(Number(quoteId)) ? String(quoteId) : Number(quoteId)
+        const midVariants: any[] = []
+        if (typeof midRaw === 'number') {
+          midVariants.push(midRaw)
+          midVariants.push(String(midRaw))
+        } else {
+          midVariants.push(midRaw)
+          const numeric = Number(midRaw)
+          if (!Number.isNaN(numeric)) midVariants.push(numeric)
+        }
+        for (const name of methodNames) {
+          const fn = typeof internal[name] === 'function' ? internal[name] : null
+          if (!fn) continue
+          for (const midVariant of midVariants) {
+            try {
+              if (debug && logger) logger.info('尝试通过 OneBot internal.get_msg 获取引用消息', { name, messageId: midVariant })
+              const ret = await fn.call(internal, midVariant)
+              if (debug && logger) logger.info('OneBot internal.get_msg 返回数据', { hasData: !!ret, keys: ret ? Object.keys(ret) : [] })
+              const msg = ret?.message || ret?.data?.message
+              if (Array.isArray(msg)) {
+                if (debug && logger) logger.info('OneBot internal.get_msg 返回消息段', { segmentCount: msg.length, types: msg.map((s: any) => s?.type) })
+                msg.forEach((seg: any, index: number) => {
+                  if (!seg) return
+                  if (seg.type === 'image' || seg.type === 'img') {
+                    const d = seg.data || {}
+                    if (debug && logger) logger.info('OneBot internal.get_msg 图片段数据', { index, data: d })
+                    const attrs: any = {
+                      url: d.url || d.file_url,
+                      file: d.file || d.filename,
+                      fileId: d.file || d.file_id || d.id,
+                      // 兼容 Koishi 统一字段
+                      src: d.url || d.file || d.filename
+                    }
+                    traverse({ type: 'image', attrs, data: attrs }, `onebot.internal.get_msg[${index}]`)
+                  }
+                })
+                // 已成功拿到数据则跳出
+                throw new Error('__ONEBOT_INTERNAL_MSG_FETCHED__')
+              } else {
+                if (debug && logger) logger.warn('OneBot internal.get_msg 未返回消息数组', { ret })
+              }
+            } catch (err: any) {
+              if (err?.message === '__ONEBOT_INTERNAL_MSG_FETCHED__') {
+                return segments
+              }
+              if (debug && logger) logger.warn('OneBot internal.get_msg 获取失败', { name, messageId: midVariant, message: err?.message || err })
+            }
+          }
+        }
+      } catch (e: any) {
+        if (debug && logger) logger.warn('OneBot internal.get_msg 处理异常', { message: e?.message || e })
+      }
+    }
   }
 
   return segments
@@ -485,27 +584,243 @@ async function fetchImageBuffer(ctx: Context, session: Session, segment: ImageSe
 async function fetchBufferFromBot(ctx: Context, session: Session, identifier: string, debug: boolean, logger?: any): Promise<Buffer | null> {
   if (!identifier) return null
   const bot: any = session.bot
-  if (!bot || typeof bot.getFile !== 'function') return null
+  let buffer: Buffer | null = null
+
+  if (bot && typeof bot.getFile === 'function') {
+    try {
+      if (debug && logger) {
+        logger.info(`尝试通过 bot.getFile 获取文件: ${identifier}`)
+      }
+      const result = await bot.getFile(identifier)
+      if (result) {
+        if (typeof result.base64 === 'string') {
+          const b = bufferFromBase64(result.base64)
+          if (b) return b
+        }
+        if (typeof result.url === 'string') {
+          const response = await axios.get(result.url, { responseType: 'arraybuffer' })
+          return Buffer.from(response.data)
+        }
+      }
+    } catch (error: any) {
+      if (debug && logger) {
+        logger.warn(`通过 bot.getFile 获取文件失败: ${error?.message || error}`, { identifier })
+      }
+    }
+  }
+
+  if (session.platform === 'onebot' && bot && bot.internal) {
+    const internal: any = bot.internal
+    const tryLocalCandidates = async (candidates: any[]): Promise<Buffer | null> => {
+      const tried = new Set<string>()
+      for (const candidate of candidates) {
+        if (typeof candidate !== 'string') continue
+        const key = candidate.trim()
+        if (!key || tried.has(key)) continue
+        tried.add(key)
+        const localBuffer = await tryReadLocalFileBuffer(candidate)
+        if (localBuffer) {
+          if (debug && logger) {
+            logger.info('通过 OneBot 返回的本地路径获取图片数据', { path: candidate, length: localBuffer.length })
+          }
+          return localBuffer
+        }
+      }
+      return null
+    }
+    const tryExtract = async (ret: any): Promise<Buffer | null> => {
+      if (!ret) return null
+      if (typeof ret === 'string') {
+        if (/^https?:\/\//i.test(ret)) {
+          const resp = await axios.get(ret, { responseType: 'arraybuffer' })
+          return Buffer.from(resp.data)
+        }
+        const b = bufferFromBase64(ret)
+        if (b) return b
+        const local = await tryLocalCandidates([ret])
+        if (local) return local
+      }
+      const url = ret.url || ret.data?.url || ret.file?.url || ret.image?.url
+      if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
+        const resp = await axios.get(url, { responseType: 'arraybuffer' })
+        return Buffer.from(resp.data)
+      }
+      if (typeof ret.base64 === 'string') {
+        const b = bufferFromBase64(ret.base64)
+        if (b) return b
+      }
+      const localCandidates: any[] = [
+        ret.path,
+        ret.localPath,
+        ret.filePath,
+        ret.file_path,
+        ret.file,
+        ret.filename,
+        ret.name,
+        ret.src,
+        ret.data?.path,
+        ret.data?.localPath,
+        ret.data?.filePath,
+        ret.data?.file_path,
+        ret.data?.file,
+        ret.image?.path,
+        ret.image?.file,
+        ret.file?.path,
+        ret.file?.file
+      ]
+      const local = await tryLocalCandidates(localCandidates)
+      if (local) return local
+      return null
+    }
+    const httpLike = /^https?:\/\//i.test(identifier)
+    const attempts: Array<{ method: string, args: any[] }> = [
+      { method: 'getImage', args: [identifier] },
+      { method: 'get_image', args: [identifier] },
+      { method: 'getFile', args: [identifier] },
+      { method: 'get_file', args: [identifier] }
+    ]
+    if (httpLike) {
+      attempts.push({ method: 'downloadFile', args: [identifier] })
+      attempts.push({ method: 'download_file', args: [identifier] })
+    }
+    for (const { method, args } of attempts) {
+      const fn = typeof internal[method] === 'function' ? internal[method] : null
+      if (!fn) continue
+      try {
+        if (debug && logger) {
+          logger.info('尝试通过 OneBot internal 获取文件', { method, args })
+        }
+        const ret = await fn.apply(internal, args)
+        const b = await tryExtract(ret)
+        if (b) return b
+      } catch (e: any) {
+        if (debug && logger) {
+          logger.warn('OneBot internal 获取失败', { method, args, message: e?.message || e })
+        }
+      }
+    }
+  }
+
+  return buffer
+}
+
+async function ensureCacheDir(debug: boolean, logger?: any) {
+  if (cacheDirEnsured) return
   try {
+    await fs.mkdir(CACHE_DIR, { recursive: true })
+    cacheDirEnsured = true
     if (debug && logger) {
-      logger.info(`尝试通过 bot.getFile 获取文件: ${identifier}`)
-    }
-    const result = await bot.getFile(identifier)
-    if (!result) return null
-    if (typeof result.base64 === 'string') {
-      const buffer = bufferFromBase64(result.base64)
-      if (buffer) return buffer
-    }
-    if (typeof result.url === 'string') {
-      const response = await axios.get(result.url, { responseType: 'arraybuffer' })
-      return Buffer.from(response.data)
+      logger.info('已准备图片缓存目录', { cacheDir: CACHE_DIR })
     }
   } catch (error: any) {
     if (debug && logger) {
-      logger.warn(`通过 bot.getFile 获取文件失败: ${error?.message || error}`, { identifier })
+      logger.warn('创建图片缓存目录失败', { cacheDir: CACHE_DIR, message: error?.message || error })
+    }
+    throw error
+  }
+}
+
+function guessFileExtension(attrs: Record<string, any>, sourceHint?: string) {
+  const candidates = [
+    attrs?.file,
+    attrs?.filename,
+    attrs?.name,
+    attrs?.image,
+    attrs?.path,
+    attrs?.localPath,
+    attrs?.src,
+    attrs?.url,
+    sourceHint
+  ]
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue
+    const sanitized = candidate.split('?')[0].split('#')[0]
+    const ext = path.extname(sanitized)
+    if (ext) return ext
+  }
+  return '.img'
+}
+
+async function createTempCacheFile(buffer: Buffer, attrs: Record<string, any>, sourceHint: string | undefined, debug: boolean, logger?: any) {
+  try {
+    await ensureCacheDir(debug, logger)
+  } catch {
+    return null
+  }
+
+  const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}${guessFileExtension(attrs, sourceHint)}`
+  const filePath = path.join(CACHE_DIR, filename)
+  try {
+    await fs.writeFile(filePath, buffer)
+    if (debug && logger) {
+      logger.info('已写入临时缓存图片', { filePath, size: buffer.length })
+    }
+    return filePath
+  } catch (error: any) {
+    if (debug && logger) {
+      logger.warn('写入临时缓存图片失败', { filePath, message: error?.message || error })
+    }
+    return null
+  }
+}
+
+async function removeTempCacheFile(filePath: string, debug: boolean, logger?: any) {
+  try {
+    await fs.unlink(filePath)
+    if (debug && logger) {
+      logger.info('已删除临时缓存图片', { filePath })
+    }
+  } catch (error: any) {
+    if (debug && logger) {
+      logger.warn('删除临时缓存图片失败', { filePath, message: error?.message || error })
     }
   }
-  return null
+}
+
+async function extractMetadataWithCache(buffer: Buffer, attrs: Record<string, any>, debug: boolean, logger: any, sourceHint?: string) {
+  let tempPath: string | null = null
+  try {
+    tempPath = await createTempCacheFile(buffer, attrs, sourceHint, debug, logger)
+    if (tempPath) {
+      return await extractSDMetadata(tempPath, debug, logger)
+    }
+    return await extractSDMetadata(buffer, debug, logger)
+  } finally {
+    if (tempPath) {
+      await removeTempCacheFile(tempPath, debug, logger)
+    }
+  }
+}
+
+async function downloadImageToBuffer(url: string, debug: boolean, logger?: any): Promise<Buffer | null> {
+  try {
+    if (debug && logger) {
+      logger.info(`发起 HTTP 请求: ${url}`)
+    }
+    const response = await axios.get(url, {
+      responseType: 'arraybuffer',
+      timeout: 30000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    })
+
+    if (debug && logger) {
+      logger.info('图片下载成功:', {
+        status: response.status,
+        contentType: response.headers['content-type'],
+        contentLength: response.headers['content-length'],
+        dataSize: response.data.byteLength || response.data.length
+      })
+    }
+
+    return Buffer.from(response.data)
+  } catch (error: any) {
+    if (debug && logger) {
+      logger.warn('图片下载失败', { url, message: error?.message || error })
+    }
+    return null
+  }
 }
 
 async function tryReadLocalFileBuffer(target: string): Promise<Buffer | null> {
@@ -1466,7 +1781,7 @@ function buildMetadataMessages(results: SDMetadata[]): string[] {
 
 function formatOutput(session: Session, messages: string[], useForward: boolean): string | h[] {
   if (!useForward) {
-    return messages.join('\n\n===\n\n')
+    return buildPlainTextChunks(messages)
   }
 
   return buildForwardNodes(session, messages)
@@ -1495,14 +1810,26 @@ async function trySendOneBotForward(session: Session, messages: string[], debug:
   const selfId = session.selfId || bot?.selfId
   const displayName = session.bot?.user?.name || bot?.nickname || 'Bot'
 
-  const forwardNodes = messages.map(msg => ({
-    type: 'node',
-    data: {
-      name: displayName,
-      uin: selfId,
-      content: msg
+  const MAX_NODE_CHARS = 3000
+  const forwardNodes = ([] as any[])
+  for (const msg of messages) {
+    const full = String(msg || '')
+    let start = 0
+    while (start < full.length) {
+      let end = Math.min(start + MAX_NODE_CHARS, full.length)
+      // 优先在换行处切分，避免破坏 JSON 片段
+      if (end < full.length) {
+        const near = full.lastIndexOf('\n', end - 1)
+        if (near > start + 500) end = near + 1
+      }
+      const chunk = full.slice(start, end)
+      forwardNodes.push({
+        type: 'node',
+        data: { name: displayName, uin: selfId, content: chunk }
+      })
+      start = end
     }
-  }))
+  }
 
   const chId = String(session.channelId || '')
   const isPrivate = !!session.isDirect || chId.startsWith('private:')
