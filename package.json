@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-sdkkt",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Read EXIF and prompt information from Stable Diffusion generated images | 从sd生成的图像中读取metadata 来 kkt",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
