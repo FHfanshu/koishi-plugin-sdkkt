@@ -40,6 +40,12 @@ interface SDMetadata {
   size?: string
   model?: string
   parameters?: string
+  naiBasePrompt?: string
+  naiCharPrompts?: string[]
+  naiNegBasePrompt?: string
+  naiNegCharPrompts?: string[]
+  naiVibe?: boolean
+  naiCharRefs?: string[]
 }
 
 interface ImageSegment {
@@ -282,11 +288,24 @@ async function collectImageSegments(session: Session, debug: boolean = false, lo
   }
   const append = (raw: any, origin: string) => {
     if (!raw) return
-    const type = raw.type || 'image'
-    if (type !== 'image' && type !== 'img') return
-
+    const rawType = raw.type || 'image'
     const attrs = raw.attrs && typeof raw.attrs === 'object' ? { ...raw.attrs } : undefined
     const data = raw.data && typeof raw.data === 'object' ? { ...raw.data } : undefined
+
+    let isImage = rawType === 'image' || rawType === 'img'
+    if (!isImage && (rawType === 'file' || rawType === 'attachment')) {
+      const a: any = attrs || {}
+      const d: any = data || {}
+      const mime: string | undefined = a.mime || a.mimetype || a.contentType || d.mime || d.mimetype || d.contentType
+      const name: string | undefined = a.name || a.filename || a.file || d.name || d.filename || d.file
+      const url: string | undefined = a.url || a.src || d.url || d.src
+      const checkExt = (s?: string) => typeof s === 'string' && /\.(png|jpe?g|webp|gif|bmp|tiff|heic|heif)(?:[?#].*)?$/i.test(s)
+      if (typeof mime === 'string' && mime.toLowerCase().startsWith('image/')) isImage = true
+      else if (checkExt(name) || checkExt(url)) isImage = true
+    }
+    if (!isImage) return
+
+    const type = 'image'
 
     const key = makeKey({ ...raw, attrs, data })
     if (key && seenKeys.has(key)) {
@@ -695,13 +714,46 @@ async function extractSDMetadata(source: string | Buffer | ArrayBuffer, debug: b
           
           if (comment) {
             const commentData = JSON.parse(comment)
-            if (description) metadata.prompt = description
-            if (commentData.uc) metadata.negativePrompt = commentData.uc
+            if (!metadata.prompt && description) metadata.prompt = description
+            if (!metadata.negativePrompt && commentData.uc) metadata.negativePrompt = commentData.uc
             if (commentData.steps) metadata.steps = String(commentData.steps)
             if (commentData.scale) metadata.cfgScale = String(commentData.scale)
             if (commentData.seed) metadata.seed = String(commentData.seed)
             if (commentData.sampler) metadata.sampler = commentData.sampler
-            
+            if (typeof commentData.uncond_per_vibe === 'boolean') metadata.naiVibe = !!commentData.uncond_per_vibe
+
+            const v4p = commentData.v4_prompt
+            const v4n = commentData.v4_negative_prompt
+            if (v4p && v4p.caption) {
+              const base = v4p.caption.base_caption
+              const chars = Array.isArray(v4p.caption.char_captions) ? v4p.caption.char_captions.map((c: any) => c && c.char_caption).filter((x: any) => !!x) : []
+              if (base) metadata.naiBasePrompt = base
+              if (chars.length) metadata.naiCharPrompts = chars
+            }
+            if (v4n && v4n.caption) {
+              const base = v4n.caption.base_caption
+              const chars = Array.isArray(v4n.caption.char_captions) ? v4n.caption.char_captions.map((c: any) => c && c.char_caption).filter((x: any) => !!x) : []
+              if (base) metadata.naiNegBasePrompt = base
+              if (chars.length) metadata.naiNegCharPrompts = chars
+            }
+
+            const descs = Array.isArray(commentData.director_reference_descriptions) ? commentData.director_reference_descriptions : []
+            const strengths = Array.isArray(commentData.director_reference_strengths) ? commentData.director_reference_strengths : []
+            const secondaries = Array.isArray(commentData.director_reference_secondary_strengths) ? commentData.director_reference_secondary_strengths : []
+            const refs: string[] = []
+            const n = Math.max(descs.length, strengths.length, secondaries.length)
+            for (let i = 0; i < n; i++) {
+              const cap = (descs[i] && (descs[i].caption?.base_caption || descs[i].caption || descs[i])) as any
+              const s1 = strengths[i]
+              const s2 = secondaries[i]
+              let text = ''
+              if (cap) text += String(cap)
+              if (s1 !== undefined) text += (text ? ' ' : '') + String(s1)
+              if (s2 !== undefined) text += '/' + String(s2)
+              if (text) refs.push(text)
+            }
+            if (refs.length) metadata.naiCharRefs = refs
+
             if (debug && logger) {
               logger.info('成功解析 NovelAI 元数据')
             }
@@ -841,12 +893,45 @@ async function extractSDMetadata(source: string | Buffer | ArrayBuffer, debug: b
               
               if (comment) {
                 const commentData = JSON.parse(comment)
-                if (description) metadata.prompt = description
-                if (commentData.uc) metadata.negativePrompt = commentData.uc
+                if (!metadata.prompt && description) metadata.prompt = description
+                if (!metadata.negativePrompt && commentData.uc) metadata.negativePrompt = commentData.uc
                 if (commentData.steps) metadata.steps = String(commentData.steps)
                 if (commentData.scale) metadata.cfgScale = String(commentData.scale)
                 if (commentData.seed) metadata.seed = String(commentData.seed)
                 if (commentData.sampler) metadata.sampler = commentData.sampler
+                if (typeof commentData.uncond_per_vibe === 'boolean') metadata.naiVibe = !!commentData.uncond_per_vibe
+
+                const v4p = commentData.v4_prompt
+                const v4n = commentData.v4_negative_prompt
+                if (v4p && v4p.caption) {
+                  const base = v4p.caption.base_caption
+                  const chars = Array.isArray(v4p.caption.char_captions) ? v4p.caption.char_captions.map((c: any) => c && c.char_caption).filter((x: any) => !!x) : []
+                  if (base) metadata.naiBasePrompt = base
+                  if (chars.length) metadata.naiCharPrompts = chars
+                }
+                if (v4n && v4n.caption) {
+                  const base = v4n.caption.base_caption
+                  const chars = Array.isArray(v4n.caption.char_captions) ? v4n.caption.char_captions.map((c: any) => c && c.char_caption).filter((x: any) => !!x) : []
+                  if (base) metadata.naiNegBasePrompt = base
+                  if (chars.length) metadata.naiNegCharPrompts = chars
+                }
+
+                const descs = Array.isArray(commentData.director_reference_descriptions) ? commentData.director_reference_descriptions : []
+                const strengths = Array.isArray(commentData.director_reference_strengths) ? commentData.director_reference_strengths : []
+                const secondaries = Array.isArray(commentData.director_reference_secondary_strengths) ? commentData.director_reference_secondary_strengths : []
+                const refs: string[] = []
+                const n = Math.max(descs.length, strengths.length, secondaries.length)
+                for (let i = 0; i < n; i++) {
+                  const cap = (descs[i] && (descs[i].caption?.base_caption || descs[i].caption || descs[i])) as any
+                  const s1 = strengths[i]
+                  const s2 = secondaries[i]
+                  let text = ''
+                  if (cap) text += String(cap)
+                  if (s1 !== undefined) text += (text ? ' ' : '') + String(s1)
+                  if (s2 !== undefined) text += '/' + String(s2)
+                  if (text) refs.push(text)
+                }
+                if (refs.length) metadata.naiCharRefs = refs
                 
                 if (debug && logger) {
                   logger.info('成功解析 NovelAI JPEG/WebP 元数据')
@@ -1331,11 +1416,21 @@ function buildMetadataMessages(results: SDMetadata[]): string[] {
       parts.push('---')
     }
 
-    if (metadata.prompt) {
+    if (metadata.naiBasePrompt || (metadata.naiCharPrompts && metadata.naiCharPrompts.length)) {
+      if (metadata.naiBasePrompt) parts.push(`Base Prompt:\n${metadata.naiBasePrompt}`)
+      if (metadata.naiCharPrompts && metadata.naiCharPrompts.length) {
+        parts.push(`Character Prompt:\n${metadata.naiCharPrompts.join('\n')}`)
+      }
+    } else if (metadata.prompt) {
       parts.push(`正向提示词:\n${metadata.prompt}`)
     }
 
-    if (metadata.negativePrompt) {
+    if (metadata.naiNegBasePrompt || (metadata.naiNegCharPrompts && metadata.naiNegCharPrompts.length)) {
+      if (metadata.naiNegBasePrompt) parts.push(`\nNegative Base Prompt:\n${metadata.naiNegBasePrompt}`)
+      if (metadata.naiNegCharPrompts && metadata.naiNegCharPrompts.length) {
+        parts.push(`\nNegative Character Prompt:\n${metadata.naiNegCharPrompts.join('\n')}`)
+      }
+    } else if (metadata.negativePrompt) {
       parts.push(`\n负向提示词:\n${metadata.negativePrompt}`)
     }
 
@@ -1349,6 +1444,14 @@ function buildMetadataMessages(results: SDMetadata[]): string[] {
 
     if (params.length > 0) {
       parts.push(`\n参数:\n${params.join('\n')}`)
+    }
+
+    if (typeof metadata.naiVibe === 'boolean') {
+      parts.push(`\nVibe: ${metadata.naiVibe ? '开启' : '关闭'}`)
+    }
+
+    if (metadata.naiCharRefs && metadata.naiCharRefs.length) {
+      parts.push(`\nCharacter References:\n${metadata.naiCharRefs.join('\n')}`)
     }
 
     if (metadata.parameters) {
