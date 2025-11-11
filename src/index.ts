@@ -13,6 +13,8 @@ export interface Config {
   enableDebugLog: boolean
   privateOnly: boolean
   groupAutoParseWhitelist: string[]
+  /** 是否优先使用文件缓存（默认：false，直接使用内存Buffer） */
+  preferFileCache?: boolean
 }
 
 function buildPlainTextChunks(messages: string[]): h[] {
@@ -232,7 +234,7 @@ async function processImageSegments(ctx: Context, session: Session, imageSegment
           if (config.enableDebugLog) {
             logger.info('尝试使用本地路径加载图片', { path: directUrl, length: localDirectBuffer.length })
           }
-          metadata = await extractMetadataWithCache(localDirectBuffer, attrs, config.enableDebugLog, logger, directUrl)
+          metadata = await extractMetadataWithCache(localDirectBuffer, attrs, config.enableDebugLog, logger, directUrl, config.preferFileCache)
         } else {
           if (config.enableDebugLog) {
             logger.info(`尝试使用直接 URL 下载图片: ${directUrl}`)
@@ -240,7 +242,7 @@ async function processImageSegments(ctx: Context, session: Session, imageSegment
 
           const downloaded = await downloadImageToBuffer(directUrl, config.enableDebugLog, logger)
           if (downloaded) {
-            metadata = await extractMetadataWithCache(downloaded, attrs, config.enableDebugLog, logger, directUrl)
+            metadata = await extractMetadataWithCache(downloaded, attrs, config.enableDebugLog, logger, directUrl, config.preferFileCache)
           } else {
             metadata = await extractSDMetadata(directUrl, config.enableDebugLog, logger)
           }
@@ -890,12 +892,28 @@ async function removeTempCacheFile(filePath: string, debug: boolean, logger?: an
   }
 }
 
-async function extractMetadataWithCache(buffer: Buffer, attrs: Record<string, any>, debug: boolean, logger: any, sourceHint?: string) {
+async function extractMetadataWithCache(buffer: Buffer, attrs: Record<string, any>, debug: boolean, logger: any, sourceHint?: string, preferFileCache: boolean = false) {
+  // 默认使用 Buffer 直接处理，性能更好
+  if (!preferFileCache) {
+    if (debug && logger) {
+      logger.info('使用内存 Buffer 直接解析图片元数据')
+    }
+    return await extractSDMetadata(buffer, debug, logger)
+  }
+
+  // 如果启用文件缓存，才使用临时文件方案
   let tempPath: string | null = null
   try {
     tempPath = await createTempCacheFile(buffer, attrs, sourceHint, debug, logger)
     if (tempPath) {
+      if (debug && logger) {
+        logger.info('使用临时文件缓存解析图片元数据', { tempPath })
+      }
       return await extractSDMetadata(tempPath, debug, logger)
+    }
+    // 如果创建临时文件失败，回退到 Buffer 方案
+    if (debug && logger) {
+      logger.info('临时文件创建失败，回退到内存 Buffer 方案')
     }
     return await extractSDMetadata(buffer, debug, logger)
   } finally {
@@ -1070,17 +1088,27 @@ async function extractSDMetadata(source: string | Buffer | ArrayBuffer, debug: b
 
         buffer = Buffer.from(response.data)
       } else {
-        const base64Buffer = bufferFromBase64(trimmed)
-        if (base64Buffer) {
+        // 尝试作为本地文件路径读取
+        const localFileBuffer = await tryReadLocalFileBuffer(trimmed)
+        if (localFileBuffer) {
           if (debug && logger) {
-            logger.info('从 Base64 字符串解码图片数据', { length: base64Buffer.length })
+            logger.info('从本地文件读取图片数据', { path: trimmed, size: localFileBuffer.length })
           }
-          buffer = base64Buffer
+          buffer = localFileBuffer
         } else {
-          if (debug && logger) {
-            logger.warn('未识别的图片来源字符串，无法解析')
+          // 最后尝试作为 Base64 字符串
+          const base64Buffer = bufferFromBase64(trimmed)
+          if (base64Buffer) {
+            if (debug && logger) {
+              logger.info('从 Base64 字符串解码图片数据', { length: base64Buffer.length })
+            }
+            buffer = base64Buffer
+          } else {
+            if (debug && logger) {
+              logger.warn('未识别的图片来源字符串，无法解析')
+            }
+            return null
           }
-          return null
         }
       }
     } else {

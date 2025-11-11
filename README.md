@@ -94,6 +94,7 @@ Model: AnythingV5
 | enableDebugLog | boolean | false | 是否启用调试日志（用于排查图片接收问题） |
 | privateOnly | boolean | false | 是否仅在私聊中启用 |
 | groupAutoParseWhitelist | string[] | [] | **新增**：群聊白名单，在这些群聊中自动解析群文件图片（无需命令） |
+| preferFileCache | boolean | false | **新增**：是否优先使用文件缓存（默认使用内存Buffer，性能更好） |
 
 ### useForward 说明
 
@@ -112,6 +113,13 @@ Model: AnythingV5
   - 元数据提取过程
 
 **建议**：当遇到图片接收问题（特别是 QQ OneBot 平台）时，启用此选项以获取详细的调试信息，帮助定位问题。
+
+### preferFileCache 说明
+
+- `false`（默认）：直接使用内存 Buffer 处理图片，性能更好，适合大多数情况
+- `true`：优先使用临时文件缓存，适合内存受限的环境或大文件处理
+
+**建议**：保持默认 `false` 即可，除非遇到内存不足的问题。
 
 ## 支持的格式
 
