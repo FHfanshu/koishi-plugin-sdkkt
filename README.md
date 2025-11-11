@@ -1,6 +1,6 @@
 # koishi-plugin-sdexif
 
-[![npm](https://img.shields.io/npm/v/koishi-plugin-sdexif?style=flat-square)](https://www.npmjs.com/package/koishi-plugin-sdexif)
+[![npm](https://img.shields.io/npm/v/koishi-plugin-sdkkt?style=flat-square)](https://www.npmjs.com/package/koishi-plugin-sdkkt)
 
 读取 Stable Diffusion 生成图片中的 EXIF 信息（prompt、参数等）的 Koishi 插件。
 
@@ -20,13 +20,13 @@
 
 ```bash
 # 使用 npm
-npm install koishi-plugin-sdexif
+npm install koishi-plugin-sdkkt
 
 # 使用 yarn
-yarn add koishi-plugin-sdexif
+yarn add koishi-plugin-sdkkt
 
 # 使用 pnpm
-pnpm add koishi-plugin-sdexif
+pnpm add koishi-plugin-sdkkt
 ```
 
 ## 使用方法
