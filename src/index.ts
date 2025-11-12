@@ -92,7 +92,7 @@ export function apply(ctx: Context, config: Config) {
       const segments = await collectImageSegments(session, config.enableDebugLog, logger)
       if (segments.length === 0) return next()
 
-      const resp = await processImages(ctx, session, segments, config, logger)
+      const resp = await processImages(ctx, session, segments, config, logger, true)
       if (typeof resp === 'string') {
         if (resp === '未能从图片中读取到 Stable Diffusion 信息') return
         await session.send(resp)
@@ -116,7 +116,8 @@ async function processImages(
   session: Session,
   imageSegments: ImageSegment[],
   config: Config,
-  logger: any
+  logger: any,
+  isSilentMode = false
 ): Promise<string | h[] | void> {
   if (config.enableDebugLog) {
     logger.info('消息元素分析:', {
@@ -181,12 +182,71 @@ async function processImages(
     return '未能从图片中读取到 Stable Diffusion 信息'
   }
 
+  // 在静默模式下，如果只找到 EXIF 回退数据（没有其他 SD metadata），则不发送任何消息
+  if (isSilentMode && results.every(r => r.exifFallback && !r.prompt && !r.naiBasePrompt && !r.parameters)) {
+    return
+  }
+
   const messages = results.map((metadata, i) => {
     const result = formatMetadataResult(metadata)
     return segments.length > 1 ? `图片 ${i + 1}:\n---\n${result}` : result
   })
 
-  return formatOutput(session, messages, config.useForward)
+  // For long ComfyUI workflow outputs, split into multiple messages
+  const splitMessages: string[] = []
+  const maxLength = 2000  // Maximum characters per message
+
+  for (const message of messages) {
+    if (message.length <= maxLength) {
+      splitMessages.push(message)
+    } else {
+      // Split long message into chunks
+      // First extract and preserve prompt at the beginning
+      let content = message
+      let promptHeader = ''
+      const promptLine = content.split('\n').find(line => line.startsWith('正向提示词:') || line.startsWith('Prompt:'))
+
+      if (promptLine && promptLine.length < maxLength) {
+        promptHeader = promptLine + '\n\n'
+        content = content.replace(promptLine, '').trim()
+      }
+
+      // Split remaining content
+      const chunks: string[] = []
+
+      let remaining = content
+      while (remaining.length > 0) {
+        if (remaining.length <= maxLength) {
+          chunks.push(remaining)
+          break
+        }
+
+        // Find last newline before maxLength to split nicely
+        let splitIndex = maxLength
+        const lastNewline = remaining.lastIndexOf('\n', maxLength)
+        if (lastNewline > maxLength * 0.5) {  // If newline is not too early
+          splitIndex = lastNewline
+        }
+
+        chunks.push(remaining.substring(0, splitIndex))
+        remaining = remaining.substring(splitIndex).trim()
+      }
+
+      // If we have a prompt header, prepend it to the first chunk (or create one)
+      if (promptHeader) {
+        if (chunks.length > 0) {
+          chunks[0] = promptHeader + chunks[0]
+        } else {
+          chunks.push(promptHeader)
+        }
+      }
+
+      // Drop empty chunks to avoid blank forward messages
+      splitMessages.push(...chunks.filter(c => c && c.trim().length > 0))
+    }
+  }
+
+  return formatOutput(session, splitMessages, config.useForward)
 }
 
 async function collectImageSegments(

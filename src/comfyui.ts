@@ -33,16 +33,47 @@ export function extractComfyUIMetadata(
 
 /**
  * Parse node-based workflow format
+ * Output all node information (modified to show full workflow)
  */
 function parseComfyUINodeFormat(workflow: ComfyUIWorkflow, metadata: SDMetadata): void {
   if (!workflow.nodes || !Array.isArray(workflow.nodes)) return
 
+  // Collect all nodes that have widgets_values
+  const allContent: string[] = []
+
+  for (const node of workflow.nodes) {
+    if (node.widgets_values && Array.isArray(node.widgets_values) && node.widgets_values.length > 0) {
+      let nodeInfo = `节点: ${node.type || 'Unknown'}`
+      if ((node as any).title) nodeInfo += ` (${(node as any).title})`  // Some nodes have title property
+
+      const widgetsContent: string[] = []
+      node.widgets_values.forEach((value, index) => {
+        if (value !== undefined && value !== null && value !== '') {
+          const strValue = String(value).trim()
+          if (strValue) {
+            widgetsContent.push(`${index}: ${strValue}`)
+          }
+        }
+      })
+
+      if (widgetsContent.length > 0) {
+        allContent.push(`${nodeInfo}\n${widgetsContent.join('\n')}`)
+      }
+    }
+  }
+
+  // Set parameters field with all content
+  if (allContent.length > 0) {
+    metadata.parameters = allContent.join('\n\n')
+  }
+
+  // Also try to extract basic prompt info from the first few nodes for backward compatibility
   let promptNode: ComfyUINode | null = null
   let negativeNode: ComfyUINode | null = null
   let samplerNode: ComfyUINode | null = null
   let ksamplerNode: ComfyUINode | null = null
 
-  // First pass: collect standard CLIPTextEncode nodes (highest priority)
+  // First pass: collect standard CLIPTextEncode nodes
   const clipTextNodes: ComfyUINode[] = []
   for (const node of workflow.nodes) {
     if (node.type === 'CLIPTextEncode') {
@@ -54,7 +85,7 @@ function parseComfyUINodeFormat(workflow: ComfyUIWorkflow, metadata: SDMetadata)
     }
   }
 
-  // Use first two CLIPTextEncode nodes as prompt and negative prompt
+  // Use first two CLIPTextEncode nodes
   if (clipTextNodes.length > 0) {
     promptNode = clipTextNodes[0]
     if (clipTextNodes.length > 1) {
@@ -62,71 +93,27 @@ function parseComfyUINodeFormat(workflow: ComfyUIWorkflow, metadata: SDMetadata)
     }
   }
 
-  // Second pass: if no CLIPTextEncode found, look for custom nodes
-  if (!promptNode || !negativeNode) {
-    for (const node of workflow.nodes) {
-      switch (node.type) {
-        // Handle TIPO custom node (https://github.com/KohakuBlueleaf/z-tipo-extension)
-        // TIPO node contains both positive and negative in widgets_values
-        case 'TIPO':
-          if (node.widgets_values) {
-            // Only use if we don't have a prompt yet
-            if (!promptNode && node.widgets_values[0]) {
-              promptNode = {
-                type: 'TIPO',
-                widgets_values: [node.widgets_values[0]]
-              }
-            }
-            // Only use if we don't have a negative prompt yet
-            if (!negativeNode && node.widgets_values[2]) {
-              negativeNode = {
-                type: 'TIPO',
-                widgets_values: [node.widgets_values[2]]
-              }
-            }
-          }
-          break
-
-        // Handle other custom nodes that might contain widgets_values with prompts
-        case 'ShowText|pysssss':
-        case 'StringLiteral':
-          if (node.widgets_values && !promptNode) {
-            promptNode = node
-          }
-          break
-      }
-    }
-  }
-
-  // Extract prompts
+  // Extract basic metadata
   if (promptNode?.widgets_values?.[0]) {
     metadata.prompt = String(promptNode.widgets_values[0])
   }
-
   if (negativeNode?.widgets_values?.[0]) {
     metadata.negativePrompt = String(negativeNode.widgets_values[0])
   }
-
-  // Extract sampler parameters
   if (ksamplerNode?.widgets_values) {
     const values = ksamplerNode.widgets_values
-
-    // KSampler typical order: seed, steps, cfg, sampler_name, scheduler, denoise
     if (values[0] !== undefined) metadata.seed = String(values[0])
     if (values[1] !== undefined) metadata.steps = String(values[1])
     if (values[2] !== undefined) metadata.cfgScale = String(values[2])
     if (values[3] !== undefined) metadata.sampler = `${values[3]}`
   }
-
-  // Extract from SamplerCustom
   if (samplerNode?.widgets_values) {
     const values = samplerNode.widgets_values
-
     if (values[0] !== undefined) metadata.sampler = String(values[0])
     if (values[1] !== undefined) metadata.cfgScale = String(values[1])
   }
 
-  // Look for additional metadata in other nodes
+  // Extract additional metadata
   extractComfyUIAdditionalData(workflow.nodes, metadata)
 }
 
