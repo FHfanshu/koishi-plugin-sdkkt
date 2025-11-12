@@ -21,6 +21,9 @@ export interface SDMetadata {
   naiNegCharPrompts?: string[]
   naiVibe?: boolean
   naiCharRefs?: string[]
+
+  // Fallback EXIF data when no SD metadata is found
+  exifFallback?: Record<string, any>
 }
 
 export interface ImageSegment {

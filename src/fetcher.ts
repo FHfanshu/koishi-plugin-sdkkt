@@ -99,17 +99,26 @@ export async function fetchImage(
     }
 
     // Try group files (special case)
-    if (attrs.name && attrs.size && attrs.size <= 10 * 1024 * 1024) {
-      const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.heic', '.heif']
-      const fileExt = require('path').extname(attrs.name || '').toLowerCase()
+    // Check for both 'size' (number) and 'fileSize' (string) attributes
+    const sizeAttr = attrs.size || attrs.fileSize
+    const nameAttr = attrs.name || attrs.file
 
-      if (imageExts.includes(fileExt)) {
-        const fileBuffer = await fetchGroupFile(ctx, session, attrs)
-        if (fileBuffer) {
-          return {
-            buffer: fileBuffer,
-            source: `group-file:${attrs.file}`,
-            sourceType: 'bot-file'
+    if (nameAttr && sizeAttr) {
+      // Convert to number (handles both string and number types)
+      const sizeNum = typeof sizeAttr === 'string' ? parseInt(sizeAttr, 10) : sizeAttr
+
+      if (!isNaN(sizeNum) && sizeNum <= 10 * 1024 * 1024) {
+        const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.heic', '.heif']
+        const fileExt = require('path').extname(nameAttr).toLowerCase()
+
+        if (imageExts.includes(fileExt)) {
+          const fileBuffer = await fetchGroupFile(ctx, session, attrs)
+          if (fileBuffer) {
+            return {
+              buffer: fileBuffer,
+              source: `group-file:${attrs.file}`,
+              sourceType: 'bot-file'
+            }
           }
         }
       }
@@ -316,6 +325,12 @@ async function fetchGroupFile(
         continue
       }
     }
+  }
+
+  // Fallback: try to fetch using fileId if file attribute doesn't work
+  if (attrs.fileId || attrs.file_id) {
+    const fileId = attrs.fileId || attrs.file_id
+    return await fetchFromBotAPI(ctx, session, fileId)
   }
 
   return null

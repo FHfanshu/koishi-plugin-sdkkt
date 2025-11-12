@@ -8,15 +8,24 @@ import { extractNovelAIMetadata } from './novelai'
  * Parse WebP metadata from buffer
  * Supports EXIF, XMP chunks and binary search
  */
-export function parseWebPMetadata(buffer: Buffer): ParseResult<SDMetadata> {
+export function parseWebPMetadata(buffer: Buffer, logger?: any): ParseResult<SDMetadata> {
   try {
     const metadata: SDMetadata = {}
+    let exifData: Record<string, any> | null = null
 
-    // 1. Try EXIF/XMP parsing using ExifReader
+    // 1. Try EXIF/XMP parsing using ExifReader - enhanced search
     try {
-      const tags = ExifReader.load(buffer, { expanded: true })
+      const tags = ExifReader.load(buffer, {
+        expanded: true,
+        includeUnknown: true  // Include unknown tags
+      })
 
-      // Look for SD parameters in EXIF fields
+      if (logger) logger.info('[WebP] EXIF parsing attempted, checking for SD metadata fields')
+
+      // Collect all EXIF data for fallback
+      exifData = {}
+
+      // Look for SD parameters in EXIF fields - check all fields
       const exifFields = [
         'UserComment',
         'ImageDescription',
@@ -25,23 +34,71 @@ export function parseWebPMetadata(buffer: Buffer): ParseResult<SDMetadata> {
         'Software'
       ]
 
-      for (const fieldName of exifFields) {
-        const field = (tags.exif as any)?.[fieldName]
-        if (field) {
-          const fieldValue: string | undefined = field?.description || field?.value || field?.text
-          if (fieldValue && typeof fieldValue === 'string') {
-            if (fieldValue.includes('Steps:') || fieldValue.includes('Sampler:') ||
-                fieldValue.includes('CFG scale:') || fieldValue.includes('Seed:')) {
-              metadata.parameters = fieldValue
-              parseA1111Parameters(fieldValue, metadata)
-              break
+      // Check all EXIF fields, not just standard ones
+      const exif = tags.exif
+      if (exif && !metadata.parameters) {
+        if (logger) logger.info(`[WebP] EXIF object found with ${Object.keys(exif).length} fields, scanning for SD parameters`)
+
+        for (const [fieldName, field] of Object.entries(exif as any)) {
+          try {
+            // Skip invalid fields
+            if (!field || typeof field !== 'object') continue
+
+            const fieldAny = field as any
+            const fieldValue: string | undefined = fieldAny?.description || fieldAny?.value || fieldAny?.text
+
+            // Collect all fields for fallback
+            exifData[fieldName] = fieldAny
+
+            if (fieldValue && typeof fieldValue === 'string') {
+              if (fieldValue.includes('Steps:') || fieldValue.includes('Sampler:') ||
+                  fieldValue.includes('CFG scale:') || fieldValue.includes('Seed:')) {
+                const lines = fieldValue.split('\n').slice(0, 2).join('\n')
+                if (logger) {
+                  logger.info(`[WebP] Found SD metadata in EXIF field "${fieldName}"`)
+                  logger.info(`[WebP] Content preview (first 2 lines):\n${lines}`)
+                }
+                metadata.parameters = fieldValue
+                parseA1111Parameters(fieldValue, metadata)
+                break
+              }
+            }
+          } catch {
+            // Skip problematic fields
+          }
+        }
+      }
+
+      // Try standard fields if not found yet
+      if (!metadata.parameters && exif) {
+        if (logger) logger.info('[WebP] Checking standard EXIF fields for SD metadata')
+
+        for (const fieldName of exifFields) {
+          const field = (exif as any)?.[fieldName]
+          if (field) {
+            // Collect field for fallback
+            exifData[fieldName] = field
+
+            const fieldValue: string | undefined = field?.description || field?.value || field?.text
+            if (fieldValue && typeof fieldValue === 'string') {
+              if (fieldValue.includes('Steps:') || fieldValue.includes('Sampler:') ||
+                  fieldValue.includes('CFG scale:') || fieldValue.includes('Seed:')) {
+                const lines = fieldValue.split('\n').slice(0, 2).join('\n')
+                if (logger) {
+                  logger.info(`[WebP] Found SD metadata in standard EXIF field "${fieldName}"`)
+                  logger.info(`[WebP] Content preview (first 2 lines):\n${lines}`)
+                }
+                metadata.parameters = fieldValue
+                parseA1111Parameters(fieldValue, metadata)
+                break
+              }
             }
           }
         }
       }
 
       // Check for NovelAI format
-      if (tags?.exif?.Software) {
+      if (!metadata.parameters && tags?.exif?.Software) {
         const software = tags.exif.Software.description || tags.exif.Software.value
         if (software === 'NovelAI') {
           const descField: any = tags.exif?.ImageDescription
@@ -52,23 +109,56 @@ export function parseWebPMetadata(buffer: Buffer): ParseResult<SDMetadata> {
 
           if (comment) {
             extractNovelAIMetadata(comment, description, metadata)
+            metadata.parameters = comment
           }
         }
       }
 
-      // XMP data
+      // XMP data - enhanced search
       if (tags.xmp && !metadata.parameters) {
-        const xmpFields = ['description', 'Description', 'dc:description', 'tiff:ImageDescription']
-        for (const xmpField of xmpFields) {
-          const xmpDesc = (tags.xmp as any)[xmpField]
-          if (xmpDesc) {
-            const descValue = typeof xmpDesc === 'string' ? xmpDesc : (xmpDesc.value || xmpDesc.description)
-            if (descValue && typeof descValue === 'string' && descValue.includes('Steps:')) {
-              metadata.parameters = descValue
-              parseA1111Parameters(descValue, metadata)
-              break
+        if (logger) logger.info('[WebP] XMP data found, searching for SD metadata')
+
+        // Collect XMP fields
+        exifData['XMP'] = tags.xmp
+
+        try {
+          // Try to stringify and search through XMP
+          const xmpStr = JSON.stringify(tags.xmp)
+          if (xmpStr.includes('Steps:') || xmpStr.includes('parameters')) {
+            const extracted = extractFromXMPLikeText(xmpStr)
+            if (extracted && extracted.includes('Steps:')) {
+              const lines = extracted.split('\n').slice(0, 2).join('\n')
+              if (logger) {
+                logger.info('[WebP] Found SD metadata in XMP data')
+                logger.info(`[WebP] Content preview (first 2 lines):\n${lines}`)
+              }
+              metadata.parameters = extracted
+              parseA1111Parameters(extracted, metadata)
             }
           }
+
+          // Also try field-based search
+          if (!metadata.parameters) {
+            const xmpFields = ['description', 'Description', 'dc:description', 'tiff:ImageDescription']
+            for (const xmpField of xmpFields) {
+              const xmpDesc = (tags.xmp as any)[xmpField]
+              if (xmpDesc) {
+                const descValue = typeof xmpDesc === 'string' ? xmpDesc : (xmpDesc.value || xmpDesc.description)
+                if (descValue && typeof descValue === 'string' && descValue.includes('Steps:')) {
+                  const lines = descValue.split('\n').slice(0, 2).join('\n')
+                  if (logger) {
+                    logger.info(`[WebP] Found SD metadata in XMP field "${xmpField}"`)
+                    logger.info(`[WebP] Content preview (first 2 lines):\n${lines}`)
+                  }
+                  metadata.parameters = descValue
+                  parseA1111Parameters(descValue, metadata)
+                  break
+                }
+              }
+            }
+          }
+        } catch {
+          // Continue if XMP parsing fails
         }
       }
 
@@ -84,12 +174,26 @@ export function parseWebPMetadata(buffer: Buffer): ParseResult<SDMetadata> {
       }
     }
 
-    // 3. Binary search as last resort
+    // 3. Binary search as last resort - use more aggressive search
     if (!metadata.parameters) {
-      const foundText = binarySearchForWebPMetadata(buffer)
+      // Use the enhanced binary search from jpeg.ts
+      const { binarySearchForMetadata } = require('./jpeg')
+      const foundText = binarySearchForMetadata(buffer, 'webp')
       if (foundText) {
         metadata.parameters = foundText
         parseA1111Parameters(foundText, metadata)
+      }
+    }
+
+    // If no SD metadata found but we have EXIF data, use fallback
+    if (Object.keys(metadata).length === 0 && exifData && Object.keys(exifData).length > 0) {
+      if (logger) {
+        logger.info(`[WebP] No SD metadata found, but ${Object.keys(exifData).length} EXIF fields available - using fallback`)
+      }
+      metadata.exifFallback = exifData
+      return {
+        success: true,
+        data: metadata
       }
     }
 
@@ -219,69 +323,33 @@ function extractWebPChunkText(chunkData: Buffer): string {
 }
 
 /**
- * Binary search for SD metadata in WebP
+ * Extract from XMP-like text
  */
-function binarySearchForWebPMetadata(buffer: Buffer): string | null {
-  const minLength = 50
-
-  // Search patterns
-  const patterns = [
-    /Steps:\s*\d+.*?Sampler:\s*[^,\n]+/gi,
-    /CFG\s*scale:\s*[\d.]+.*?Seed:\s*\d+/gi,
-  ]
-
-  // Try different encodings
-  for (const encoding of ['utf8', 'utf16le', 'latin1', 'ascii']) {
-    try {
-      const text = buffer.toString(encoding as BufferEncoding)
-
-      for (const pattern of patterns) {
-        const matches = text.match(pattern)
-        if (matches && matches.length > 0) {
-          const matchIndex = text.indexOf(matches[0])
-          const startPos = Math.max(0, matchIndex - 100)
-          const endPos = Math.min(text.length, matchIndex + 1000)
-          const candidate = text.slice(startPos, endPos)
-
-          if (candidate.includes('Steps:') && (
-            candidate.includes('Sampler:') ||
-            candidate.includes('CFG scale:')
-          )) {
-            return candidate
-          }
-        }
-      }
-    } catch {
-      continue
-    }
-  }
-
-  // Search for byte patterns
-  const binaryPatterns = [
-    Buffer.from('Steps:'),
-    Buffer.from('parameters')
-  ]
-
-  for (const pattern of binaryPatterns) {
-    const index = buffer.indexOf(pattern)
-    if (index !== -1) {
-      const startPos = Math.max(0, index - 200)
-      const endPos = Math.min(buffer.length, index + 2000)
-      const chunk = buffer.slice(startPos, endPos)
-
-      for (const encoding of ['utf8', 'utf16le', 'latin1', 'ascii']) {
+function extractFromXMPLikeText(xmpStr: string): string | null {
+  try {
+    // Look for JSON objects that might contain parameters
+    const jsonMatches = xmpStr.match(/\{[^}]*steps[^}]*\}/gi)
+    if (jsonMatches) {
+      for (const match of jsonMatches) {
         try {
-          const text = chunk.toString(encoding as BufferEncoding)
-          if (text.includes('Steps:') && text.length > minLength) {
-            return text
+          const parsed = JSON.parse(match)
+          if (parsed.parameters || (parsed.steps && parsed.sampler)) {
+            return parsed.parameters || `Steps: ${parsed.steps}, Sampler: ${parsed.sampler}`
           }
         } catch {
           continue
         }
       }
     }
-  }
 
+    // Look for plain text parameters
+    const paramMatch = xmpStr.match(/[^}{]*Steps:\s*\d+[^}{]*Sampler:[^}{]*/g)
+    if (paramMatch && paramMatch.length > 0) {
+      return paramMatch[0]
+    }
+  } catch {
+    //
+  }
   return null
 }
 

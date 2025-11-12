@@ -11,7 +11,7 @@ import { extractStealthPngMetadata } from './stealth'
  * Parse PNG metadata from buffer
  * Supports tEXt, iTXt, zTXt chunks and Stealth PNG
  */
-export function parsePNGMetadata(buffer: Buffer): ParseResult<SDMetadata> {
+export function parsePNGMetadata(buffer: Buffer, logger?: any): ParseResult<SDMetadata> {
   try {
     // Extract text chunks
     const textChunks = extractPngTextChunks(buffer)

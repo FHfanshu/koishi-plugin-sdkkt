@@ -13,7 +13,7 @@ import { parseWebPMetadata } from './webp'
 /**
  * Extract SD metadata from buffer
  */
-export function extractMetadata(buffer: Buffer): ParseResult<SDMetadata> {
+export function extractMetadata(buffer: Buffer, logger?: any): ParseResult<SDMetadata> {
   try {
     if (!buffer || buffer.length === 0) {
       return { success: false, error: 'Empty buffer' }
@@ -29,15 +29,15 @@ export function extractMetadata(buffer: Buffer): ParseResult<SDMetadata> {
 
     switch (format) {
       case 'png':
-        result = parsePNGMetadata(buffer)
+        result = parsePNGMetadata(buffer, logger)
         break
 
       case 'jpeg':
-        result = parseJPEGMetadata(buffer)
+        result = parseJPEGMetadata(buffer, logger)
         break
 
       case 'webp':
-        result = parseWebPMetadata(buffer)
+        result = parseWebPMetadata(buffer, logger)
         break
 
       default:
@@ -160,6 +160,38 @@ export function formatMetadataResult(metadata: SDMetadata): string {
 
   if (metadata.parameters && !parts.some(p => p.includes(metadata.parameters!))) {
     parts.push(`\n完整参数:\n${metadata.parameters}`)
+  }
+
+  // EXIF fallback - show when no SD metadata is found
+  if (metadata.exifFallback && Object.keys(metadata.exifFallback).length > 0) {
+    parts.push(`\nEXIF 信息:
+该图片不包含标准的 Stable Diffusion 元数据，但包含以下 EXIF 字段：`)
+
+    const fallbackParts: string[] = []
+
+    // Process EXIF fields
+    for (const [fieldName, fieldData] of Object.entries(metadata.exifFallback)) {
+      if (fieldName === 'XMP') {
+        fallbackParts.push(`\nXMP 数据:
+${JSON.stringify(fieldData, null, 2)}`)
+      } else if (fieldName === 'IPTC') {
+        fallbackParts.push(`\nIPTC 数据:
+${JSON.stringify(fieldData, null, 2)}`)
+      } else {
+        // Regular EXIF field
+        const field = fieldData as any
+        const value = field?.description || field?.value || field?.text || JSON.stringify(field)
+        if (value && value !== 'undefined') {
+          fallbackParts.push(`  ${fieldName}: ${value}`)
+        }
+      }
+    }
+
+    if (fallbackParts.length > 0) {
+      parts.push(fallbackParts.join('\n'))
+    } else {
+      parts.push(JSON.stringify(metadata.exifFallback, null, 2))
+    }
   }
 
   return parts.join('\n')

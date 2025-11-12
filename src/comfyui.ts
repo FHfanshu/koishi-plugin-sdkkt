@@ -42,25 +42,59 @@ function parseComfyUINodeFormat(workflow: ComfyUIWorkflow, metadata: SDMetadata)
   let samplerNode: ComfyUINode | null = null
   let ksamplerNode: ComfyUINode | null = null
 
-  // Find relevant nodes
+  // First pass: collect standard CLIPTextEncode nodes (highest priority)
+  const clipTextNodes: ComfyUINode[] = []
   for (const node of workflow.nodes) {
-    switch (node.type) {
-      case 'CLIPTextEncode':
-        if (!promptNode) {
-          promptNode = node
-        } else if (!negativeNode) {
-          negativeNode = node
-        }
-        break
+    if (node.type === 'CLIPTextEncode') {
+      clipTextNodes.push(node)
+    } else if (node.type === 'KSampler' || node.type === 'KSamplerAdvanced') {
+      ksamplerNode = node
+    } else if (node.type === 'SamplerCustom') {
+      samplerNode = node
+    }
+  }
 
-      case 'KSampler':
-      case 'KSamplerAdvanced':
-        ksamplerNode = node
-        break
+  // Use first two CLIPTextEncode nodes as prompt and negative prompt
+  if (clipTextNodes.length > 0) {
+    promptNode = clipTextNodes[0]
+    if (clipTextNodes.length > 1) {
+      negativeNode = clipTextNodes[1]
+    }
+  }
 
-      case 'SamplerCustom':
-        samplerNode = node
-        break
+  // Second pass: if no CLIPTextEncode found, look for custom nodes
+  if (!promptNode || !negativeNode) {
+    for (const node of workflow.nodes) {
+      switch (node.type) {
+        // Handle TIPO custom node (https://github.com/KohakuBlueleaf/z-tipo-extension)
+        // TIPO node contains both positive and negative in widgets_values
+        case 'TIPO':
+          if (node.widgets_values) {
+            // Only use if we don't have a prompt yet
+            if (!promptNode && node.widgets_values[0]) {
+              promptNode = {
+                type: 'TIPO',
+                widgets_values: [node.widgets_values[0]]
+              }
+            }
+            // Only use if we don't have a negative prompt yet
+            if (!negativeNode && node.widgets_values[2]) {
+              negativeNode = {
+                type: 'TIPO',
+                widgets_values: [node.widgets_values[2]]
+              }
+            }
+          }
+          break
+
+        // Handle other custom nodes that might contain widgets_values with prompts
+        case 'ShowText|pysssss':
+        case 'StringLiteral':
+          if (node.widgets_values && !promptNode) {
+            promptNode = node
+          }
+          break
+      }
     }
   }
 

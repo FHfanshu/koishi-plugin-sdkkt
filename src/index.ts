@@ -160,7 +160,7 @@ async function processImages(
           })
         }
 
-        const metadata = await extractMetadata(fetchResult.buffer)
+        const metadata = await extractMetadata(fetchResult.buffer, config.enableDebugLog ? logger : undefined)
 
         if (metadata.success && metadata.data) {
           if (config.enableDebugLog) {
