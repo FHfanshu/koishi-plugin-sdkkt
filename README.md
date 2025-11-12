@@ -1,4 +1,4 @@
-# koishi-plugin-sdexif
+# koishi-plugin-sdkkt
 
 [![npm](https://img.shields.io/npm/v/koishi-plugin-sdkkt?style=flat-square)](https://www.npmjs.com/package/koishi-plugin-sdkkt)
 
