@@ -84,6 +84,13 @@ export function parsePNGMetadata(buffer: Buffer, logger?: any): ParseResult<SDMe
       }
     }
 
+    if (Object.keys(metadata).length === 0) {
+      return {
+        success: false,
+        error: 'No SD metadata found in PNG'
+      }
+    }
+
     return {
       success: true,
       data: metadata

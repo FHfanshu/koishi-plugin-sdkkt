@@ -67,39 +67,87 @@ function parseComfyUINodeFormat(workflow: ComfyUIWorkflow, metadata: SDMetadata)
     metadata.parameters = allContent.join('\n\n')
   }
 
-  // Also try to extract basic prompt info from the first few nodes for backward compatibility
-  let promptNode: ComfyUINode | null = null
-  let negativeNode: ComfyUINode | null = null
-  let samplerNode: ComfyUINode | null = null
-  let ksamplerNode: ComfyUINode | null = null
-
-  // First pass: collect standard CLIPTextEncode nodes
-  const clipTextNodes: ComfyUINode[] = []
+  // Build node ID map for link tracing
+  const nodeById: Map<number, ComfyUINode> = new Map()
   for (const node of workflow.nodes) {
-    if (node.type === 'CLIPTextEncode') {
-      clipTextNodes.push(node)
-    } else if (node.type === 'KSampler' || node.type === 'KSamplerAdvanced') {
+    if (node.id !== undefined) {
+      nodeById.set(node.id, node)
+    }
+  }
+
+  // Build link map: linkId -> [sourceNodeId, sourceSlot, targetNodeId, targetSlot]
+  // Links format: [linkId, sourceNodeId, sourceSlot, targetNodeId, targetSlot, type]
+  const linkMap: Map<number, number[]> = new Map()
+  if (workflow.links && Array.isArray(workflow.links)) {
+    for (const link of workflow.links) {
+      if (Array.isArray(link) && link.length >= 5) {
+        linkMap.set(link[0], link)
+      }
+    }
+  }
+
+  // Find KSampler node and trace positive/negative connections
+  let ksamplerNode: ComfyUINode | null = null
+  let samplerNode: ComfyUINode | null = null
+  let positiveNodeId: number | null = null
+  let negativeNodeId: number | null = null
+
+  for (const node of workflow.nodes) {
+    if (node.type === 'KSampler' || node.type === 'KSamplerAdvanced') {
       ksamplerNode = node
+      // Find positive and negative input links
+      // KSampler inputs order: model, positive, negative, latent_image (may vary by version)
+      if (node.inputs && Array.isArray(node.inputs)) {
+        for (const input of node.inputs) {
+          if (input.name === 'positive' && input.link !== undefined) {
+            const link = linkMap.get(input.link)
+            if (link) positiveNodeId = link[1]  // source node id
+          } else if (input.name === 'negative' && input.link !== undefined) {
+            const link = linkMap.get(input.link)
+            if (link) negativeNodeId = link[1]
+          }
+        }
+      }
+      break
     } else if (node.type === 'SamplerCustom') {
       samplerNode = node
     }
   }
 
-  // Use first two CLIPTextEncode nodes
-  if (clipTextNodes.length > 0) {
-    promptNode = clipTextNodes[0]
-    if (clipTextNodes.length > 1) {
-      negativeNode = clipTextNodes[1]
+  // Get prompt nodes by traced connections
+  const promptNode = positiveNodeId !== null ? nodeById.get(positiveNodeId) : null
+  const negativeNode = negativeNodeId !== null ? nodeById.get(negativeNodeId) : null
+
+  // Fallback: if no connections traced, use first two CLIPTextEncode nodes
+  let fallbackPromptNode: ComfyUINode | null = null
+  let fallbackNegativeNode: ComfyUINode | null = null
+  if (!promptNode || !negativeNode) {
+    const clipTextNodes: ComfyUINode[] = []
+    for (const node of workflow.nodes) {
+      if (node.type === 'CLIPTextEncode') {
+        clipTextNodes.push(node)
+      }
+    }
+    if (clipTextNodes.length > 0 && !promptNode) {
+      fallbackPromptNode = clipTextNodes[0]
+    }
+    if (clipTextNodes.length > 1 && !negativeNode) {
+      fallbackNegativeNode = clipTextNodes[1]
     }
   }
 
-  // Extract basic metadata
-  if (promptNode?.widgets_values?.[0]) {
-    metadata.prompt = String(promptNode.widgets_values[0])
+  // Extract prompts
+  const finalPromptNode = promptNode || fallbackPromptNode
+  const finalNegativeNode = negativeNode || fallbackNegativeNode
+
+  if (finalPromptNode?.widgets_values?.[0]) {
+    metadata.prompt = String(finalPromptNode.widgets_values[0])
   }
-  if (negativeNode?.widgets_values?.[0]) {
-    metadata.negativePrompt = String(negativeNode.widgets_values[0])
+  if (finalNegativeNode?.widgets_values?.[0]) {
+    metadata.negativePrompt = String(finalNegativeNode.widgets_values[0])
   }
+
+  // Extract KSampler parameters
   if (ksamplerNode?.widgets_values) {
     const values = ksamplerNode.widgets_values
     if (values[0] !== undefined) metadata.seed = String(values[0])

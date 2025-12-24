@@ -8,14 +8,26 @@ export interface FetchImageResult {
   sourceType: 'data-uri' | 'base64' | 'local' | 'bot-file' | 'url'
 }
 
+export interface FetchOptions {
+  maxFileSize?: number
+  groupFileRetryDelay?: number
+  groupFileRetryCount?: number
+}
+
 /**
  * Fetch image from various sources
  */
 export async function fetchImage(
   ctx: Context,
   session: Session,
-  segment: any
+  segment: any,
+  options?: FetchOptions | number
 ): Promise<FetchImageResult | null> {
+  // Support legacy signature: fetchImage(ctx, session, segment, maxFileSize)
+  const opts: FetchOptions = typeof options === 'number'
+    ? { maxFileSize: options }
+    : (options ?? {})
+  const maxSize = opts.maxFileSize ?? (10 * 1024 * 1024) // Default 10MB
   try {
     // Extract attributes
     const attrs = segment.attrs || segment.data || {}
@@ -107,12 +119,12 @@ export async function fetchImage(
       // Convert to number (handles both string and number types)
       const sizeNum = typeof sizeAttr === 'string' ? parseInt(sizeAttr, 10) : sizeAttr
 
-      if (!isNaN(sizeNum) && sizeNum <= 10 * 1024 * 1024) {
+      if (!isNaN(sizeNum) && sizeNum <= maxSize) {
         const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.heic', '.heif']
         const fileExt = require('path').extname(nameAttr).toLowerCase()
 
         if (imageExts.includes(fileExt)) {
-          const fileBuffer = await fetchGroupFile(ctx, session, attrs)
+          const fileBuffer = await fetchGroupFile(ctx, session, attrs, opts)
           if (fileBuffer) {
             return {
               buffer: fileBuffer,
@@ -291,41 +303,71 @@ async function fetchFromURL(url: string): Promise<Buffer | null> {
 }
 
 /**
- * Fetch group file using OneBot API
+ * Fetch group file using OneBot API with retry support
+ * QQ group files may return compressed preview on first request,
+ * retry mechanism helps get the original file
  */
 async function fetchGroupFile(
   ctx: Context,
   session: Session,
-  attrs: Record<string, any>
+  attrs: Record<string, any>,
+  opts?: FetchOptions
 ): Promise<Buffer | null> {
   const bot: any = session.bot
   if (!bot?.internal) return null
 
+  const retryDelay = opts?.groupFileRetryDelay ?? 2000
+  const retryCount = opts?.groupFileRetryCount ?? 2
   const internal: any = bot.internal
   const methods = [
     'getGroupFileUrl',
     'get_group_file_url'
   ]
 
-  for (const method of methods) {
-    const fn = internal[method]
-    if (typeof fn === 'function') {
-      try {
-        const result = await fn.call(
-          internal,
-          session.channelId,
-          attrs.file,
-          attrs.busid
-        )
+  // Helper function to attempt file fetch
+  const attemptFetch = async (): Promise<Buffer | null> => {
+    for (const method of methods) {
+      const fn = internal[method]
+      if (typeof fn === 'function') {
+        try {
+          const result = await fn.call(
+            internal,
+            session.channelId,
+            attrs.file,
+            attrs.busid
+          )
 
-        if (result?.url) {
-          return await fetchFromURL(result.url)
+          if (result?.url) {
+            return await fetchFromURL(result.url)
+          }
+        } catch {
+          continue
         }
-      } catch {
-        continue
+      }
+    }
+    return null
+  }
+
+  // First attempt
+  let buffer = await attemptFetch()
+
+  // Retry if first attempt succeeded but might be compressed preview
+  // QQ returns compressed preview on first request, original on retry
+  if (buffer && retryCount > 0 && retryDelay > 0) {
+    for (let i = 0; i < retryCount; i++) {
+      // Wait before retry
+      await new Promise(resolve => setTimeout(resolve, retryDelay))
+
+      const retryBuffer = await attemptFetch()
+      if (retryBuffer) {
+        // Use the retry result (more likely to be original)
+        buffer = retryBuffer
+        break
       }
     }
   }
+
+  if (buffer) return buffer
 
   // Fallback: try to fetch using fileId if file attribute doesn't work
   if (attrs.fileId || attrs.file_id) {

@@ -49,14 +49,20 @@ export interface JPEGAppSegments {
 }
 
 export interface ComfyUINode {
+  id?: number
   type: string
   widgets_values?: any[]
-  inputs?: any[]
+  inputs?: Array<{
+    name?: string
+    type?: string
+    link?: number
+  }>
   outputs?: any[]
 }
 
 export interface ComfyUIWorkflow {
   nodes?: ComfyUINode[]
+  links?: Array<number[]>  // [linkId, sourceNodeId, sourceSlot, targetNodeId, targetSlot, type]
   prompt?: any
   [key: string]: any
 }
