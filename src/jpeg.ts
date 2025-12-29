@@ -3,6 +3,7 @@ import ExifReader from 'exifreader'
 import { SDMetadata, JPEGAppSegments, ParseResult } from './types'
 import { parseA1111Parameters } from './a1111'
 import { extractNovelAIMetadata } from './novelai'
+import { extractComfyUIMetadata, isComfyUIFormat } from './comfyui'
 
 /**
  * Parse JPEG metadata from buffer
@@ -23,6 +24,21 @@ export function parseJPEGMetadata(buffer: Buffer, logger?: any): ParseResult<SDM
         metadata.parameters = content
         parseA1111Parameters(content, metadata)
         break
+      }
+
+      // Also check for ComfyUI JSON format in APP segments
+      if (content.includes('"class_type"') || content.includes('"nodes"')) {
+        try {
+          const parsed = JSON.parse(content)
+          if (isComfyUIFormat(parsed)) {
+            if (logger) logger.info(`[JPEG] Found ComfyUI metadata in APP segment ${appName}`)
+            extractComfyUIMetadata(parsed.nodes ? parsed : null, parsed.nodes ? null : parsed, metadata)
+            metadata.parameters = content
+            break
+          }
+        } catch {
+          // Not valid JSON, continue
+        }
       }
     }
 
@@ -135,6 +151,37 @@ export function parseJPEGMetadata(buffer: Buffer, logger?: any): ParseResult<SDM
               extractNovelAIMetadata(comment, description, metadata)
               // Set parameters as a fallback display
               metadata.parameters = comment
+            }
+          }
+        }
+
+        // Check for ComfyUI format in EXIF fields (prompt/workflow JSON)
+        if (!metadata.parameters && exifData) {
+          // Check common fields that might contain ComfyUI JSON
+          const comfyUIFields = ['prompt', 'workflow', 'UserComment', 'ImageDescription']
+
+          for (const fieldName of comfyUIFields) {
+            const field = exifData[fieldName] || (tags.exif as any)?.[fieldName]
+            if (!field) continue
+
+            const fieldValue = typeof field === 'string' ? field :
+              (field.description || field.value || field.text)
+
+            if (fieldValue && typeof fieldValue === 'string') {
+              try {
+                const parsed = JSON.parse(fieldValue)
+                if (isComfyUIFormat(parsed)) {
+                  if (logger) logger.info(`[JPEG] Found ComfyUI metadata in EXIF field "${fieldName}"`)
+                  extractComfyUIMetadata(parsed.nodes ? parsed : null, parsed.nodes ? null : parsed, metadata)
+                  // Store the raw JSON as parameters for display
+                  if (!metadata.parameters) {
+                    metadata.parameters = fieldValue
+                  }
+                  break
+                }
+              } catch {
+                // Not valid JSON, continue checking other fields
+              }
             }
           }
         }
@@ -377,10 +424,15 @@ function extractSegmentText(segmentData: Buffer): string {
   for (const encoding of encodings) {
     try {
       const text = segmentData.toString(encoding as BufferEncoding)
-      // Check if it contains SD parameters
+      // Check if it contains SD parameters (A1111 format)
       if (text.includes('Steps:') || text.includes('Sampler:') ||
           text.includes('CFG scale:') || text.includes('Seed:') ||
           text.includes('prompt')) {
+        return text
+      }
+      // Check if it contains ComfyUI format (JSON with class_type or nodes)
+      if (text.includes('"class_type"') || text.includes('"nodes"') ||
+          text.includes('"KSampler"') || text.includes('"CLIPTextEncode"')) {
         return text
       }
     } catch {
