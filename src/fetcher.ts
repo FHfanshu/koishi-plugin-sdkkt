@@ -112,9 +112,22 @@ export async function fetchImage(
       }
     }
 
+    // Direct private-file fetch for OneBot/NapCat when only file_id is present
+    const directFileId = attrs.file_id || attrs.fileId || attrs['file-id']
+    if (session.isDirect && directFileId && (segment.type === 'image' || segment.type === 'img' || segment.type === 'file' || segment.type === 'attachment')) {
+      const privateBuffer = await fetchPrivateFile(ctx, session, attrs, opts)
+      if (privateBuffer) {
+        return {
+          buffer: privateBuffer,
+          source: `private-file:${directFileId}`,
+          sourceType: 'bot-file'
+        }
+      }
+    }
+
     // Try group files (special case)
-    // Check for both 'size' (number) and 'fileSize' (string) attributes
-    // Note: Some adapters use hyphenated names like 'file-id' and 'file-size'
+    // Check for both 'size' (number) and 'fileSize' (string) attributes        
+    // Note: Some adapters use hyphenated names like 'file-id' and 'file-size'  
     const sizeAttr = attrs.size || attrs.fileSize || attrs.file_size || attrs['file-size']
     const nameAttr = attrs.name || attrs.file
     const fileIdAttr = attrs.file_id || attrs.fileId || attrs['file-id']
@@ -420,14 +433,19 @@ async function fetchPrivateFile(
   // Support both underscore and hyphenated attribute names
   const fileId = attrs.file_id || attrs.fileId || attrs['file-id']
   const fileName = attrs.file || attrs.name || attrs.fileName
-  // Extract user_id from session for private file API
-  const userId = session.userId
 
   if (!fileId) return null
 
   // Helper function to attempt file fetch using various methods
   const attemptFetch = async (): Promise<Buffer | null> => {
-    // Method 1: Try get_image with fileId (works for images in private chat)
+    // Method 0: If attrs already provides a usable URL, try it first
+    const directUrl = attrs.url || attrs.src
+    if (typeof directUrl === 'string' && /^https?:\/\//i.test(directUrl)) {
+      const directBuffer = await fetchFromURL(directUrl)
+      if (directBuffer) return directBuffer
+    }
+
+    // Method 1: Try get_image with fileId (works for images in private chat)   
     // This is the most reliable method as seen in logs
     const getImageMethods = ['getImage', 'get_image']
     for (const method of getImageMethods) {
@@ -459,19 +477,44 @@ async function fetchPrivateFile(
     }
 
     // Method 2: Try get_private_file_url with correct parameters
-    // NapCat expects: user_id (number), file_id (string)
-    const privateFileMethods = ['getPrivateFileUrl', 'get_private_file_url']
+    // NapCat expects: file_id (string)
+    const privateFileMethods = ['getPrivateFileUrl', 'get_private_file_url']    
     for (const method of privateFileMethods) {
       const fn = internal[method]
       if (typeof fn === 'function') {
         try {
-          // Call with positional arguments: user_id, file_id
-          const result = await fn.call(internal, userId, fileId)
+          // Prefer object parameters
+          let result = await fn.call(internal, { file_id: fileId })
+          if (!result) {
+            // Fallback to positional arguments: file_id only
+            result = await fn.call(internal, fileId)
+          }
           if (result?.url && /^https?:\/\//i.test(result.url)) {
             return await fetchFromURL(result.url)
           }
         } catch {
           // Ignore errors and try next method
+          continue
+        }
+      }
+    }
+
+    // Method 2.5: Try get_file (NapCat native) with file_id
+    const getFileMethods = ['getFile', 'get_file']
+    for (const method of getFileMethods) {
+      const fn = internal[method]
+      if (typeof fn === 'function') {
+        try {
+          let result = await fn.call(internal, { file_id: fileId })
+          if (!result) {
+            result = await fn.call(internal, { file: fileId })
+          }
+          if (!result) {
+            result = await fn.call(internal, fileId)
+          }
+          const buffer = await extractBufferFromResult(result)
+          if (buffer) return buffer
+        } catch {
           continue
         }
       }

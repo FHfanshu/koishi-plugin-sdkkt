@@ -1,6 +1,37 @@
 # AGENTS 计划与改动记录
 
-**最后更新**: 2025-12-24 10:00:00
+**最后更新**: 2026-01-10 21:40:00
+
+## 项目概览（来自 CLAUDE.md）
+
+- 仓库类型：Koishi 聊天机器人框架单仓库，包含自定义插件 `isthattrue`（基于多智能体 LLM 的事实核验）。
+- 运行环境：Koishi 支持 Discord/Telegram/QQ/Kook 等平台，Node.js 生态。
+- 常用命令：
+  - `yarn dev`（开发热重载）
+  - `yarn start`（生产运行）
+  - `yarn build`（构建全部插件）
+  - `yarn yakumo build isthattrue`（构建指定插件）
+  - `yarn new`（新建插件）
+  - `yarn clone`（克隆外部插件）
+- 目录结构：
+  - `external/`：本地自研插件（`isthattrue/`、`koishi-plugin-my-pig-group-friends/`）
+  - `packages/` / `plugins/`：其他包或插件（如存在）
+  - `koishi.yml`：运行配置
+  - `yakumo.yml`：构建管线
+  - `tsconfig.base.json`：共享 TS 配置
+- `isthattrue` 插件架构（`external/isthattrue/`）：
+  - 入口：`src/index.ts`（注册 `tof` 命令）
+  - 配置：`src/config.ts`（模型/超时/代理数）
+  - 关键模块：`agents/searchAgent.ts`、`agents/verifyAgent.ts`、`services/chatluna.ts`、`services/messageParser.ts`、`utils/prompts.ts`
+  - 工作流：解析消息 →（可选 OCR）→ 并行搜索 → 汇总验证 → 输出裁决（TRUE/FALSE/PARTIALLY_TRUE/UNCERTAIN）
+- 依赖与构建：
+  - 依赖 `koishi-plugin-chatluna` 提供 LLM；消息类型来自 `@langchain/core`
+  - 构建链路：`yakumo-tsc` → `yakumo-esbuild` → `client`
+- 配置要点（`koishi.yml` / `isthattrue`）：
+  - `searchModels`（搜索模型数组）、`verifyModel`（验证模型）
+  - `timeout`、`maxRetries`
+  - `enableOCR`、`verbose`
+  - `outputFormat`（auto/markdown/plain）
 
 ## 进行中
 
@@ -550,3 +581,4 @@
 - ✅ 构建成功 (`npm run build`)
 - ✅ TypeScript 编译通过
 - 待实际环境测试验证
+
