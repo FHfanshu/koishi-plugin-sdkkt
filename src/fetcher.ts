@@ -326,16 +326,25 @@ async function extractBufferFromResult(result: any): Promise<Buffer | null> {
  */
 async function fetchFromURL(url: string): Promise<Buffer | null> {
   try {
+    const isQQDownload = /qqdownloadftnv5|ftn\.qq\.com/i.test(url)
     const response = await axios.get(url, {
       responseType: 'arraybuffer',
       timeout: 30000,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        ...(isQQDownload ? { Referer: 'https://im.qq.com/', Accept: '*/*' } : {})
       },
-      maxContentLength: 50 * 1024 * 1024 // 50MB limit
+      maxContentLength: 50 * 1024 * 1024,
+      maxRedirects: 5,
+      validateStatus: (status) => status >= 200 && status < 400
     })
 
-    return Buffer.from(response.data)
+    const buffer = Buffer.from(response.data)
+    const contentType = String(response.headers?.['content-type'] || '').toLowerCase()
+    if (buffer.length < 512 && (contentType.includes('text/html') || contentType.includes('application/json'))) {
+      return null
+    }
+    return buffer
   } catch {
     return null
   }
