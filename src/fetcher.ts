@@ -114,9 +114,10 @@ export async function fetchImage(
 
     // Try group files (special case)
     // Check for both 'size' (number) and 'fileSize' (string) attributes
-    const sizeAttr = attrs.size || attrs.fileSize || attrs.file_size
+    // Note: Some adapters use hyphenated names like 'file-id' and 'file-size'
+    const sizeAttr = attrs.size || attrs.fileSize || attrs.file_size || attrs['file-size']
     const nameAttr = attrs.name || attrs.file
-    const fileIdAttr = attrs.file_id || attrs.fileId
+    const fileIdAttr = attrs.file_id || attrs.fileId || attrs['file-id']
 
     if (nameAttr && (sizeAttr || fileIdAttr)) {
       // Convert to number (handles both string and number types)
@@ -416,7 +417,8 @@ async function fetchPrivateFile(
   const retryCount = opts?.privateFileRetryCount ?? 3
   const internal: any = bot.internal
 
-  const fileId = attrs.file_id || attrs.fileId
+  // Support both underscore and hyphenated attribute names
+  const fileId = attrs.file_id || attrs.fileId || attrs['file-id']
   const fileName = attrs.file || attrs.name || attrs.fileName
   // Extract user_id from session for private file API
   const userId = session.userId
@@ -432,7 +434,8 @@ async function fetchPrivateFile(
       const fn = internal[method]
       if (typeof fn === 'function') {
         try {
-          const result = await fn.call(internal, { file: fileId })
+          // NapCat expects file parameter as a plain string, not an object
+          const result = await fn.call(internal, fileId)
           if (result) {
             // Check for base64 data
             if (result.base64) {
@@ -508,7 +511,8 @@ async function fetchPrivateFile(
           const imgFn = internal[imgMethod]
           if (typeof imgFn === 'function') {
             try {
-              const imgResult = await imgFn.call(internal, { file: fileId })
+              // NapCat expects file parameter as a plain string
+              const imgResult = await imgFn.call(internal, fileId)
               if (imgResult?.url && /^https?:\/\//i.test(imgResult.url)) {
                 const result = await fn.call(internal, imgResult.url)
                 if (result?.file) {
