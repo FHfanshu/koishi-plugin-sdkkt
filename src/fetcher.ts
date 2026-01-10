@@ -492,89 +492,65 @@ async function fetchPrivateFile(
       opts.logger.info('Available internal methods:', methods.slice(0, 30))
     }
 
-    // Method 1: Try using bot._request or bot.http to send raw API calls
-    // This is the most reliable way to bypass adapter parameter mapping
-    const sendRawRequest = async (action: string, params: Record<string, any>): Promise<any> => {
-      // Try bot._request (satori)
-      if (typeof bot._request === 'function') {
-        try {
-          return await bot._request(action, params)
-        } catch { /* ignore */ }
-      }
-
-      // Try bot.http.axios for direct HTTP calls
-      if (bot.http?.axios) {
-        try {
-          const response = await bot.http.axios.post(`/${action}`, params)
-          return response.data?.data || response.data
-        } catch { /* ignore */ }
-      }
-
-      // Try internal.$send (some adapters use this)
-      if (typeof internal.$send === 'function') {
-        try {
-          return await internal.$send(action, params)
-        } catch { /* ignore */ }
-      }
-
-      // Try using the internal methods with raw object (not destructured)
-      // Some methods accept an object directly
-      return null
-    }
-
-    // Try get_file with raw request
-    try {
-      const result = await sendRawRequest('get_file', { file_id: fileId })
-      if (opts?.debug && opts?.logger) {
-        opts.logger.info('get_file raw request result:', {
-          hasResult: !!result,
-          hasBase64: !!(result?.base64),
-          hasUrl: !!(result?.url),
-          hasFile: !!(result?.file)
-        })
-      }
-      if (result) {
-        // Check for base64 data first
-        if (result.base64) {
-          const buffer = bufferFromBase64(result.base64)
-          if (buffer) {
-            if (opts?.debug && opts?.logger) {
-              opts.logger.info('get_file returned base64 data', { size: buffer.length })
+    // Method 1: Try using internal._request for direct OneBot API calls
+    // This bypasses koishi-adapter-onebot's parameter mapping which causes issues
+    // The _request method is the raw WebSocket/HTTP sender
+    if (typeof internal._request === 'function') {
+      // Try get_file first - returns base64 for remote deployments
+      try {
+        const result = await internal._request('get_file', { file_id: fileId })
+        if (opts?.debug && opts?.logger) {
+          opts.logger.info('get_file via _request result:', {
+            hasResult: !!result,
+            hasBase64: !!(result?.base64),
+            hasUrl: !!(result?.url),
+            hasFile: !!(result?.file),
+            keys: result ? Object.keys(result) : []
+          })
+        }
+        if (result) {
+          // Check for base64 data first
+          if (result.base64) {
+            const buffer = bufferFromBase64(result.base64)
+            if (buffer) {
+              if (opts?.debug && opts?.logger) {
+                opts.logger.info('get_file returned base64 data', { size: buffer.length })
+              }
+              return buffer
             }
-            return buffer
+          }
+          // Check for HTTP URL
+          if (result.url && /^https?:\/\//i.test(result.url)) {
+            const buffer = await fetchFromURL(result.url, opts?.logger, opts?.debug)
+            if (buffer) return buffer
+          }
+          // Check for local path
+          if (result.file) {
+            const localBuffer = await tryReadLocalFileBuffer(result.file)
+            if (localBuffer) return localBuffer
           }
         }
-        // Check for HTTP URL
-        if (result.url && /^https?:\/\//i.test(result.url)) {
-          const buffer = await fetchFromURL(result.url, opts?.logger, opts?.debug)
+      } catch (e) {
+        if (opts?.debug && opts?.logger) {
+          opts.logger.warn('get_file via _request failed:', e)
+        }
+      }
+
+      // Try get_private_file_url - returns HTTP download URL
+      try {
+        const result = await internal._request('get_private_file_url', { file_id: fileId })
+        if (opts?.debug && opts?.logger) {
+          opts.logger.info('get_private_file_url via _request result:', result)
+        }
+        const url = result?.url
+        if (url && /^https?:\/\//i.test(url)) {
+          const buffer = await fetchFromURL(url, opts?.logger, opts?.debug)
           if (buffer) return buffer
         }
-        // Check for local path
-        if (result.file) {
-          const localBuffer = await tryReadLocalFileBuffer(result.file)
-          if (localBuffer) return localBuffer
+      } catch (e) {
+        if (opts?.debug && opts?.logger) {
+          opts.logger.warn('get_private_file_url via _request failed:', e)
         }
-      }
-    } catch (e) {
-      if (opts?.debug && opts?.logger) {
-        opts.logger.warn('get_file raw request failed:', e)
-      }
-    }
-
-    // Try get_private_file_url with raw request
-    try {
-      const result = await sendRawRequest('get_private_file_url', { file_id: fileId })
-      if (opts?.debug && opts?.logger) {
-        opts.logger.info('get_private_file_url raw request result:', result)
-      }
-      const url = result?.url
-      if (url && /^https?:\/\//i.test(url)) {
-        const buffer = await fetchFromURL(url, opts?.logger, opts?.debug)
-        if (buffer) return buffer
-      }
-    } catch (e) {
-      if (opts?.debug && opts?.logger) {
-        opts.logger.warn('get_private_file_url raw request failed:', e)
       }
     }
 
