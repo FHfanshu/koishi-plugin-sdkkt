@@ -502,7 +502,9 @@ async function processImages(
         groupFileRetryDelay: config.groupFileRetryDelay,
         groupFileRetryCount: config.groupFileRetryCount,
         privateFileRetryDelay: config.privateFileRetryDelay,
-        privateFileRetryCount: config.privateFileRetryCount
+        privateFileRetryCount: config.privateFileRetryCount,
+        logger,
+        debug: config.enableDebugLog
       })
 
       if (fetchResult) {
