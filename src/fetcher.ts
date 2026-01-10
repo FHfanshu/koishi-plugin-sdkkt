@@ -478,16 +478,17 @@ async function fetchPrivateFile(
 
     // Method 2: Try get_private_file_url with correct parameters
     // NapCat expects: file_id (string)
-    const privateFileMethods = ['getPrivateFileUrl', 'get_private_file_url']    
+    const privateFileMethods = ['getPrivateFileUrl', 'get_private_file_url']
     for (const method of privateFileMethods) {
       const fn = internal[method]
       if (typeof fn === 'function') {
         try {
-          // Prefer object parameters
-          let result = await fn.call(internal, { file_id: fileId })
+          // Use positional arguments to satisfy OneBot mapping: (user_id, file_id)
+          // NapCat ignores user_id for private file URL, but file_id must be present
+          let result = await fn.call(internal, null, fileId)
           if (!result) {
-            // Fallback to positional arguments: file_id only
-            result = await fn.call(internal, fileId)
+            // Fallback to positional with dummy user_id
+            result = await fn.call(internal, 0, fileId)
           }
           if (result?.url && /^https?:\/\//i.test(result.url)) {
             return await fetchFromURL(result.url)
@@ -505,12 +506,12 @@ async function fetchPrivateFile(
       const fn = internal[method]
       if (typeof fn === 'function') {
         try {
-          let result = await fn.call(internal, { file_id: fileId })
+          let result = await fn.call(internal, fileId)
           if (!result) {
-            result = await fn.call(internal, { file: fileId })
+            result = await fn.call(internal, { file_id: fileId })
           }
           if (!result) {
-            result = await fn.call(internal, fileId)
+            result = await fn.call(internal, { file: fileId })
           }
           const buffer = await extractBufferFromResult(result)
           if (buffer) return buffer
