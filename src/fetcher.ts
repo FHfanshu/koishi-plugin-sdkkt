@@ -495,10 +495,13 @@ async function fetchPrivateFile(
     // Method 1: Try using internal._request for direct OneBot API calls
     // This bypasses koishi-adapter-onebot's parameter mapping which causes issues
     // The _request method is the raw WebSocket/HTTP sender
+    // Note: _request returns the full OneBot response: { status, retcode, data: {...} }
     if (typeof internal._request === 'function') {
       // Try get_file first - returns base64 for remote deployments
       try {
-        const result = await internal._request('get_file', { file_id: fileId })
+        const rawResult = await internal._request('get_file', { file_id: fileId })
+        // Extract data from OneBot response wrapper
+        const result = rawResult?.data || rawResult
         if (opts?.debug && opts?.logger) {
           opts.logger.info('get_file via _request result:', {
             hasResult: !!result,
@@ -538,9 +541,15 @@ async function fetchPrivateFile(
 
       // Try get_private_file_url - returns HTTP download URL
       try {
-        const result = await internal._request('get_private_file_url', { file_id: fileId })
+        const rawResult = await internal._request('get_private_file_url', { file_id: fileId })
+        // Extract data from OneBot response wrapper
+        const result = rawResult?.data || rawResult
         if (opts?.debug && opts?.logger) {
-          opts.logger.info('get_private_file_url via _request result:', result)
+          opts.logger.info('get_private_file_url via _request result:', {
+            url: result?.url,
+            status: rawResult?.status,
+            retcode: rawResult?.retcode
+          })
         }
         const url = result?.url
         if (url && /^https?:\/\//i.test(url)) {
