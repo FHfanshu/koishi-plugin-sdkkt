@@ -486,15 +486,80 @@ async function fetchPrivateFile(
       if (directBuffer) return directBuffer
     }
 
-    // Method 1: Try get_file FIRST - according to NapCat docs, this returns file info including base64
-    // NapCat API: get_file({ file_id }) -> { file, url, file_size, file_name, base64 }
+    // Method 1: Try $action for direct OneBot API call (most reliable for NapCat)
+    // This bypasses koishi-adapter-onebot's parameter mapping which causes issues
+    if (typeof internal.$action === 'function' || typeof internal._action === 'function' || typeof internal.action === 'function') {
+      const actionFn = internal.$action || internal._action || internal.action
+
+      // Try get_file first - returns base64 for remote deployments
+      try {
+        const result = await actionFn.call(internal, 'get_file', { file_id: fileId })
+        if (opts?.debug && opts?.logger) {
+          opts.logger.info('get_file via $action result:', {
+            hasBase64: !!(result?.base64 || result?.data?.base64),
+            hasUrl: !!(result?.url || result?.data?.url),
+            hasFile: !!(result?.file || result?.data?.file)
+          })
+        }
+
+        // Check for base64 data first (most reliable for remote setups)
+        if (result?.base64 || result?.data?.base64) {
+          const b64 = result.base64 || result.data?.base64
+          const buffer = bufferFromBase64(b64)
+          if (buffer) {
+            if (opts?.debug && opts?.logger) {
+              opts.logger.info('get_file returned base64 data', { size: buffer.length })
+            }
+            return buffer
+          }
+        }
+
+        // Check for HTTP URL
+        const httpUrl = result?.url || result?.data?.url
+        if (httpUrl && /^https?:\/\//i.test(httpUrl)) {
+          const buffer = await fetchFromURL(httpUrl, opts?.logger, opts?.debug)
+          if (buffer) return buffer
+        }
+
+        // Check for local file path
+        const filePath = result?.file || result?.data?.file
+        if (filePath) {
+          const localBuffer = await tryReadLocalFileBuffer(filePath)
+          if (localBuffer) return localBuffer
+        }
+      } catch (e) {
+        if (opts?.debug && opts?.logger) {
+          opts.logger.warn('get_file via $action failed:', e)
+        }
+      }
+
+      // Try get_private_file_url - returns HTTP download URL
+      try {
+        const result = await actionFn.call(internal, 'get_private_file_url', { file_id: fileId })
+        if (opts?.debug && opts?.logger) {
+          opts.logger.info('get_private_file_url via $action result:', result)
+        }
+        const url = result?.url || result?.data?.url
+        if (url && /^https?:\/\//i.test(url)) {
+          const buffer = await fetchFromURL(url, opts?.logger, opts?.debug)
+          if (buffer) return buffer
+        }
+      } catch (e) {
+        if (opts?.debug && opts?.logger) {
+          opts.logger.warn('get_private_file_url via $action failed:', e)
+        }
+      }
+    }
+
+    // Method 2: Try get_file with various parameter formats
+    // koishi-adapter-onebot may map parameters differently
     const getFileMethods = ['getFile', 'get_file']
     for (const method of getFileMethods) {
       const fn = internal[method]
       if (typeof fn === 'function') {
         try {
-          // Try with file_id parameter (NapCat native format)
-          let result = await fn.call(internal, { file_id: fileId })
+          // Try with plain string first (some adapters expect this)
+          let result = await fn.call(internal, fileId)
 
           // Check for base64 data first (most reliable for remote setups)
           if (result?.base64 || result?.data?.base64) {
@@ -527,15 +592,15 @@ async function fetchPrivateFile(
       }
     }
 
-    // Method 2: Try get_private_file_url - this returns the actual HTTP download URL
-    // NapCat returns: { data: { url: 'http://...' } }
+    // Method 3: Try get_private_file_url with plain string parameter
+    // koishi-adapter-onebot maps object to wrong parameters, try string instead
     const privateFileMethods = ['getPrivateFileUrl', 'get_private_file_url']
     for (const method of privateFileMethods) {
       const fn = internal[method]
       if (typeof fn === 'function') {
         try {
-          // NapCat expects: { file_id: string } - try object form first
-          let result = await fn.call(internal, { file_id: fileId })
+          // Try with plain string (file_id as positional parameter)
+          let result = await fn.call(internal, fileId)
           // Extract URL from nested data structure
           let url = result?.url || result?.data?.url
           if (url && /^https?:\/\//i.test(url)) {
@@ -549,7 +614,7 @@ async function fetchPrivateFile(
       }
     }
 
-    // Method 3: Try get_image with fileId (fallback for same-machine setups)
+    // Method 4: Try get_image with fileId (fallback for same-machine setups)
     // Note: NapCat returns local path in 'file' and 'url' fields, NOT HTTP URL
     const getImageMethods = ['getImage', 'get_image']
     for (const method of getImageMethods) {
@@ -583,7 +648,7 @@ async function fetchPrivateFile(
       }
     }
 
-    // Method 4: Try nc_get_file (NapCat specific)
+    // Method 5: Try nc_get_file (NapCat specific)
     const ncFileMethods = ['ncGetFile', 'nc_get_file']
     for (const method of ncFileMethods) {
       const fn = internal[method]
@@ -607,7 +672,7 @@ async function fetchPrivateFile(
       }
     }
 
-    // Method 5: Try download_file with URL string (not object)
+    // Method 6: Try download_file with URL string (not object)
     const downloadMethods = ['downloadFile', 'download_file']
     for (const method of downloadMethods) {
       const fn = internal[method]
