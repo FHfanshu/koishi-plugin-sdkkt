@@ -486,7 +486,130 @@ async function fetchPrivateFile(
       if (directBuffer) return directBuffer
     }
 
-    // Method 1: Try $action for direct OneBot API call (most reliable for NapCat)
+    // Debug: List available internal methods
+    if (opts?.debug && opts?.logger) {
+      const methods = Object.keys(internal).filter(k => typeof internal[k] === 'function')
+      opts.logger.info('Available internal methods:', methods.slice(0, 30))
+    }
+
+    // Method 1: Try using bot._request or bot.http to send raw API calls
+    // This is the most reliable way to bypass adapter parameter mapping
+    const sendRawRequest = async (action: string, params: Record<string, any>): Promise<any> => {
+      // Try bot._request (satori)
+      if (typeof bot._request === 'function') {
+        try {
+          return await bot._request(action, params)
+        } catch { /* ignore */ }
+      }
+
+      // Try bot.http.axios for direct HTTP calls
+      if (bot.http?.axios) {
+        try {
+          const response = await bot.http.axios.post(`/${action}`, params)
+          return response.data?.data || response.data
+        } catch { /* ignore */ }
+      }
+
+      // Try internal.$send (some adapters use this)
+      if (typeof internal.$send === 'function') {
+        try {
+          return await internal.$send(action, params)
+        } catch { /* ignore */ }
+      }
+
+      // Try using the internal methods with raw object (not destructured)
+      // Some methods accept an object directly
+      return null
+    }
+
+    // Try get_file with raw request
+    try {
+      const result = await sendRawRequest('get_file', { file_id: fileId })
+      if (opts?.debug && opts?.logger) {
+        opts.logger.info('get_file raw request result:', {
+          hasResult: !!result,
+          hasBase64: !!(result?.base64),
+          hasUrl: !!(result?.url),
+          hasFile: !!(result?.file)
+        })
+      }
+      if (result) {
+        // Check for base64 data first
+        if (result.base64) {
+          const buffer = bufferFromBase64(result.base64)
+          if (buffer) {
+            if (opts?.debug && opts?.logger) {
+              opts.logger.info('get_file returned base64 data', { size: buffer.length })
+            }
+            return buffer
+          }
+        }
+        // Check for HTTP URL
+        if (result.url && /^https?:\/\//i.test(result.url)) {
+          const buffer = await fetchFromURL(result.url, opts?.logger, opts?.debug)
+          if (buffer) return buffer
+        }
+        // Check for local path
+        if (result.file) {
+          const localBuffer = await tryReadLocalFileBuffer(result.file)
+          if (localBuffer) return localBuffer
+        }
+      }
+    } catch (e) {
+      if (opts?.debug && opts?.logger) {
+        opts.logger.warn('get_file raw request failed:', e)
+      }
+    }
+
+    // Try get_private_file_url with raw request
+    try {
+      const result = await sendRawRequest('get_private_file_url', { file_id: fileId })
+      if (opts?.debug && opts?.logger) {
+        opts.logger.info('get_private_file_url raw request result:', result)
+      }
+      const url = result?.url
+      if (url && /^https?:\/\//i.test(url)) {
+        const buffer = await fetchFromURL(url, opts?.logger, opts?.debug)
+        if (buffer) return buffer
+      }
+    } catch (e) {
+      if (opts?.debug && opts?.logger) {
+        opts.logger.warn('get_private_file_url raw request failed:', e)
+      }
+    }
+
+    // Method 1.5: Try calling internal methods directly with correct signature
+    // For get_file, the signature might be: get_file(file_id: string) or get_file(file: string)
+    if (typeof internal.getFile === 'function') {
+      try {
+        // Try file_id directly as first parameter
+        const result = await internal.getFile(fileId)
+        if (opts?.debug && opts?.logger) {
+          opts.logger.info('getFile(fileId) result:', {
+            hasResult: !!result,
+            keys: result ? Object.keys(result) : []
+          })
+        }
+        if (result?.base64) {
+          const buffer = bufferFromBase64(result.base64)
+          if (buffer) return buffer
+        }
+        if (result?.url && /^https?:\/\//i.test(result.url)) {
+          const buffer = await fetchFromURL(result.url, opts?.logger, opts?.debug)
+          if (buffer) return buffer
+        }
+        if (result?.file) {
+          const localBuffer = await tryReadLocalFileBuffer(result.file)
+          if (localBuffer) return localBuffer
+        }
+      } catch (e) {
+        if (opts?.debug && opts?.logger) {
+          opts.logger.warn('getFile(fileId) failed:', e)
+        }
+      }
+    }
+
+    // Method 2: Try $action for direct OneBot API call (most reliable for NapCat)
     // This bypasses koishi-adapter-onebot's parameter mapping which causes issues
     if (typeof internal.$action === 'function' || typeof internal._action === 'function' || typeof internal.action === 'function') {
       const actionFn = internal.$action || internal._action || internal.action
