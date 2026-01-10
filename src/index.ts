@@ -12,6 +12,7 @@ export interface Config {
   enableDebugLog: boolean
   privateOnly: boolean
   groupAutoParseWhitelist: string[]
+  privateAutoParseEnabled?: boolean
   preferFileCache?: boolean
   spyEnabled?: boolean
   spyGroups?: string[]
@@ -27,6 +28,8 @@ export interface Config {
   globalDedupeTimeout?: number
   groupFileRetryDelay?: number
   groupFileRetryCount?: number
+  privateFileRetryDelay?: number
+  privateFileRetryCount?: number
 }
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -66,7 +69,10 @@ export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     groupAutoParseWhitelist: Schema.array(Schema.string())
       .default([])
-      .description('群聊白名单：在这些群聊中自动解析图片（无需命令），为空则禁用')
+      .description('群聊白名单：在这些群聊中自动解析图片（无需命令），为空则禁用'),
+    privateAutoParseEnabled: Schema.boolean()
+      .default(false)
+      .description('私聊自动解析：在私聊中自动解析收到的图片/文件（无需命令）')
   }).description('自动解析'),
 
   // 解析与限制
@@ -94,7 +100,13 @@ export const Config: Schema<Config> = Schema.intersect([
       .description('群文件获取重试延迟（毫秒）- QQ群文件首次获取可能返回压缩图，需等待后重试'),
     groupFileRetryCount: Schema.number()
       .default(2)
-      .description('群文件获取重试次数（默认2次）')
+      .description('群文件获取重试次数（默认2次）'),
+    privateFileRetryDelay: Schema.number()
+      .default(3000)
+      .description('私聊文件获取重试延迟（毫秒）- 私聊文件可能需要等待服务器处理'),
+    privateFileRetryCount: Schema.number()
+      .default(3)
+      .description('私聊文件获取重试次数（默认3次）')
   }).description('解析与限制'),
 
   // 缓存
@@ -350,6 +362,40 @@ export function apply(ctx: Context, config: Config) {
       return next()
     }
   })
+
+  // Private chat auto-parse middleware: auto-parse images/files in private chat
+  ctx.middleware(async (session, next) => {
+    try {
+      if (!config.privateAutoParseEnabled) return next()
+      if (!session || !session.isDirect) return next()
+
+      // Skip if message contains command keywords
+      const contentLower = (session.content || '').toLowerCase()
+      if (contentLower.includes('sdexif') || contentLower.includes('读图')) {
+        return next()
+      }
+
+      await ensureCacheDirectory()
+      const segments = await collectImageSegments(session, config.enableDebugLog, logger, config)
+      if (segments.length === 0) return next()
+
+      if (config.enableDebugLog) {
+        logger.info('私聊自动解析：检测到图片', {
+          count: segments.length,
+          sources: segments.map(s => s._source)
+        })
+      }
+
+      const resp = await processImages(ctx, session, segments, config, logger, true, true)
+      await sendAutoParseResult(session, resp)
+      return
+    } catch (e: any) {
+      if (config.enableDebugLog) {
+        logger.warn('私聊自动解析处理失败', e)
+      }
+      return next()
+    }
+  })
 }
 
 /**
@@ -454,7 +500,9 @@ async function processImages(
       const fetchResult = await fetchImage(ctx, session, segment, {
         maxFileSize: config.maxFileSize,
         groupFileRetryDelay: config.groupFileRetryDelay,
-        groupFileRetryCount: config.groupFileRetryCount
+        groupFileRetryCount: config.groupFileRetryCount,
+        privateFileRetryDelay: config.privateFileRetryDelay,
+        privateFileRetryCount: config.privateFileRetryCount
       })
 
       if (fetchResult) {
@@ -720,6 +768,25 @@ async function fetchQuotedMessage(session: Session, traverse: Function): Promise
                     src: d.url || d.file || d.filename
                   }
                   traverse({ type: 'image', attrs, data: attrs }, `onebot.internal[${index}]`)
+                } else if (seg?.type === 'file') {
+                  // Handle file segments (e.g., group file uploads)
+                  const d = seg.data || {}
+                  const name = d.name || d.file || ''
+                  const fileExt = path.extname(name).toLowerCase()
+                  const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.heic', '.heif']
+
+                  if (imageExts.includes(fileExt)) {
+                    const attrs = {
+                      url: d.url || d.file_url,
+                      file: d.file || d.file_id || d.id,
+                      fileId: d.file || d.file_id || d.id,
+                      name: d.name,
+                      size: d.size || d.file_size,
+                      busid: d.busid,
+                      src: d.url || d.file
+                    }
+                    traverse({ type: 'file', attrs, data: attrs }, `onebot.internal.file[${index}]`)
+                  }
                 }
               })
               return

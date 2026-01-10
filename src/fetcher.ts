@@ -12,6 +12,8 @@ export interface FetchOptions {
   maxFileSize?: number
   groupFileRetryDelay?: number
   groupFileRetryCount?: number
+  privateFileRetryDelay?: number
+  privateFileRetryCount?: number
 }
 
 /**
@@ -112,18 +114,35 @@ export async function fetchImage(
 
     // Try group files (special case)
     // Check for both 'size' (number) and 'fileSize' (string) attributes
-    const sizeAttr = attrs.size || attrs.fileSize
+    const sizeAttr = attrs.size || attrs.fileSize || attrs.file_size
     const nameAttr = attrs.name || attrs.file
+    const fileIdAttr = attrs.file_id || attrs.fileId
 
-    if (nameAttr && sizeAttr) {
+    if (nameAttr && (sizeAttr || fileIdAttr)) {
       // Convert to number (handles both string and number types)
-      const sizeNum = typeof sizeAttr === 'string' ? parseInt(sizeAttr, 10) : sizeAttr
+      const sizeNum = typeof sizeAttr === 'string' ? parseInt(sizeAttr, 10) : (sizeAttr || 0)
 
-      if (!isNaN(sizeNum) && sizeNum <= maxSize) {
+      if (sizeNum <= maxSize) {
         const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.heic', '.heif']
         const fileExt = require('path').extname(nameAttr).toLowerCase()
 
         if (imageExts.includes(fileExt)) {
+          // Determine if this is a private or group file
+          const isPrivate = session.isDirect
+
+          if (isPrivate && fileIdAttr) {
+            // Try private file first
+            const privateBuffer = await fetchPrivateFile(ctx, session, attrs, opts)
+            if (privateBuffer) {
+              return {
+                buffer: privateBuffer,
+                source: `private-file:${nameAttr}`,
+                sourceType: 'bot-file'
+              }
+            }
+          }
+
+          // Try group file
           const fileBuffer = await fetchGroupFile(ctx, session, attrs, opts)
           if (fileBuffer) {
             return {
@@ -376,6 +395,172 @@ async function fetchGroupFile(
   }
 
   return null
+}
+
+/**
+ * Fetch private file using OneBot API with retry support
+ * Private files may not be immediately available after upload
+ */
+async function fetchPrivateFile(
+  ctx: Context,
+  session: Session,
+  attrs: Record<string, any>,
+  opts?: FetchOptions
+): Promise<Buffer | null> {
+  const bot: any = session.bot
+  if (!bot?.internal) return null
+
+  const retryDelay = opts?.privateFileRetryDelay ?? 3000
+  const retryCount = opts?.privateFileRetryCount ?? 3
+  const internal: any = bot.internal
+
+  const fileId = attrs.file_id || attrs.fileId
+  const fileName = attrs.file || attrs.name || attrs.fileName
+
+  if (!fileId) return null
+
+  // Helper function to attempt file fetch using various methods
+  const attemptFetch = async (): Promise<Buffer | null> => {
+    // Method 1: Try get_file (most reliable according to NapCat docs)
+    // This can use file_id or file parameter
+    const getFileMethods = ['getFile', 'get_file']
+    for (const method of getFileMethods) {
+      const fn = internal[method]
+      if (typeof fn === 'function') {
+        try {
+          // Try with file_id first
+          const result = await fn.call(internal, { file_id: fileId })
+          if (result?.url) {
+            return await fetchFromURL(result.url)
+          }
+          if (result?.base64) {
+            const buffer = bufferFromBase64(result.base64)
+            if (buffer) return buffer
+          }
+          if (result?.file) {
+            const localBuffer = await tryReadLocalFileBuffer(result.file)
+            if (localBuffer) return localBuffer
+          }
+        } catch {
+          // Try with just the fileId as string
+          try {
+            const result = await fn.call(internal, fileId)
+            if (result?.url) {
+              return await fetchFromURL(result.url)
+            }
+            if (result?.base64) {
+              const buffer = bufferFromBase64(result.base64)
+              if (buffer) return buffer
+            }
+            if (result?.file) {
+              const localBuffer = await tryReadLocalFileBuffer(result.file)
+              if (localBuffer) return localBuffer
+            }
+          } catch {
+            continue
+          }
+        }
+      }
+    }
+
+    // Method 2: Try get_private_file_url (only needs file_id per NapCat docs)
+    const privateFileMethods = ['getPrivateFileUrl', 'get_private_file_url']
+    for (const method of privateFileMethods) {
+      const fn = internal[method]
+      if (typeof fn === 'function') {
+        try {
+          // According to NapCat docs, only file_id is required
+          const result = await fn.call(internal, { file_id: fileId })
+          if (result?.url) {
+            return await fetchFromURL(result.url)
+          }
+        } catch (e: any) {
+          const errMsg = e?.message || String(e)
+          if (errMsg.includes('fileUUID not found') || errMsg.includes('not found')) {
+            // File not ready, continue to next method or retry later
+            continue
+          }
+          // Try with positional argument
+          try {
+            const result = await fn.call(internal, fileId)
+            if (result?.url) {
+              return await fetchFromURL(result.url)
+            }
+          } catch {
+            continue
+          }
+        }
+      }
+    }
+
+    // Method 3: Try nc_get_file (NapCat specific)
+    const ncFileMethods = ['ncGetFile', 'nc_get_file']
+    for (const method of ncFileMethods) {
+      const fn = internal[method]
+      if (typeof fn === 'function') {
+        try {
+          const result = await fn.call(internal, fileId)
+          if (result?.url) {
+            return await fetchFromURL(result.url)
+          }
+          if (result?.base64) {
+            const buffer = bufferFromBase64(result.base64)
+            if (buffer) return buffer
+          }
+          if (result?.file) {
+            const localBuffer = await tryReadLocalFileBuffer(result.file)
+            if (localBuffer) return localBuffer
+          }
+        } catch {
+          continue
+        }
+      }
+    }
+
+    // Method 4: Try download_file
+    const downloadMethods = ['downloadFile', 'download_file']
+    for (const method of downloadMethods) {
+      const fn = internal[method]
+      if (typeof fn === 'function') {
+        try {
+          const result = await fn.call(internal, { file_id: fileId })
+          if (result?.file) {
+            const localBuffer = await tryReadLocalFileBuffer(result.file)
+            if (localBuffer) return localBuffer
+          }
+          if (result?.base64) {
+            const buffer = bufferFromBase64(result.base64)
+            if (buffer) return buffer
+          }
+        } catch {
+          continue
+        }
+      }
+    }
+
+    return null
+  }
+
+  // First attempt
+  let buffer = await attemptFetch()
+
+  // Retry if first attempt failed (file might not be ready yet)
+  if (!buffer && retryCount > 0 && retryDelay > 0) {
+    for (let i = 0; i < retryCount; i++) {
+      // Wait before retry
+      await new Promise(resolve => setTimeout(resolve, retryDelay))
+
+      buffer = await attemptFetch()
+      if (buffer) {
+        break
+      }
+    }
+  }
+
+  if (buffer) return buffer
+
+  // Fallback: try to fetch using fileId via bot API
+  return await fetchFromBotAPI(ctx, session, fileId)
 }
 
 export default {
