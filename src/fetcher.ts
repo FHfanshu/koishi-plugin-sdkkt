@@ -286,16 +286,20 @@ async function extractBufferFromResult(result: any): Promise<Buffer | null> {
     if (localBuffer) return localBuffer
   }
 
-  // Object with various fields
+  // Object with various fields (including OneBot wrapper: { data: ... })
   if (typeof result === 'object') {
-    // Try different fields
+    const dataObj = (result && typeof result.data === 'object') ? result.data : null
     const candidates = [
       result.base64,
       result.url,
       result.path,
       result.file?.url,
       result.image?.url,
-      result.data?.url
+      dataObj?.base64,
+      dataObj?.url,
+      dataObj?.path,
+      dataObj?.file?.url,
+      dataObj?.image?.url
     ]
 
     for (const candidate of candidates) {
@@ -490,8 +494,9 @@ async function fetchPrivateFile(
             // Fallback to positional with dummy user_id
             result = await fn.call(internal, 0, fileId)
           }
-          if (result?.url && /^https?:\/\//i.test(result.url)) {
-            return await fetchFromURL(result.url)
+          const url = result?.url || result?.data?.url
+          if (url && /^https?:\/\//i.test(url)) {
+            return await fetchFromURL(url)
           }
         } catch {
           // Ignore errors and try next method
