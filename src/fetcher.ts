@@ -140,15 +140,17 @@ export async function fetchImage(
                 sourceType: 'bot-file'
               }
             }
-          }
-
-          // Try group file
-          const fileBuffer = await fetchGroupFile(ctx, session, attrs, opts)
-          if (fileBuffer) {
-            return {
-              buffer: fileBuffer,
-              source: `group-file:${attrs.file}`,
-              sourceType: 'bot-file'
+            // Don't fall through to fetchGroupFile for private chats
+            // as it would fail with "invalid uint 32: NaN" error
+          } else if (!isPrivate) {
+            // Try group file (only for group chats)
+            const fileBuffer = await fetchGroupFile(ctx, session, attrs, opts)
+            if (fileBuffer) {
+              return {
+                buffer: fileBuffer,
+                source: `group-file:${attrs.file}`,
+                sourceType: 'bot-file'
+              }
             }
           }
         }
@@ -416,79 +418,58 @@ async function fetchPrivateFile(
 
   const fileId = attrs.file_id || attrs.fileId
   const fileName = attrs.file || attrs.name || attrs.fileName
+  // Extract user_id from session for private file API
+  const userId = session.userId
 
   if (!fileId) return null
 
   // Helper function to attempt file fetch using various methods
   const attemptFetch = async (): Promise<Buffer | null> => {
-    // Method 1: Try get_file (most reliable according to NapCat docs)
-    // This can use file_id or file parameter
-    const getFileMethods = ['getFile', 'get_file']
-    for (const method of getFileMethods) {
+    // Method 1: Try get_image with fileId (works for images in private chat)
+    // This is the most reliable method as seen in logs
+    const getImageMethods = ['getImage', 'get_image']
+    for (const method of getImageMethods) {
       const fn = internal[method]
       if (typeof fn === 'function') {
         try {
-          // Try with file_id first
-          const result = await fn.call(internal, { file_id: fileId })
-          if (result?.url) {
-            return await fetchFromURL(result.url)
-          }
-          if (result?.base64) {
-            const buffer = bufferFromBase64(result.base64)
-            if (buffer) return buffer
-          }
-          if (result?.file) {
-            const localBuffer = await tryReadLocalFileBuffer(result.file)
-            if (localBuffer) return localBuffer
-          }
-        } catch {
-          // Try with just the fileId as string
-          try {
-            const result = await fn.call(internal, fileId)
-            if (result?.url) {
-              return await fetchFromURL(result.url)
-            }
-            if (result?.base64) {
+          const result = await fn.call(internal, { file: fileId })
+          if (result) {
+            // Check for base64 data
+            if (result.base64) {
               const buffer = bufferFromBase64(result.base64)
               if (buffer) return buffer
             }
-            if (result?.file) {
+            // Check for HTTP URL (not local path)
+            if (result.url && /^https?:\/\//i.test(result.url)) {
+              return await fetchFromURL(result.url)
+            }
+            // Check for local file path (might work if same machine)
+            if (result.file) {
               const localBuffer = await tryReadLocalFileBuffer(result.file)
               if (localBuffer) return localBuffer
             }
-          } catch {
-            continue
           }
+        } catch {
+          continue
         }
       }
     }
 
-    // Method 2: Try get_private_file_url (only needs file_id per NapCat docs)
+    // Method 2: Try get_private_file_url with correct parameters
+    // NapCat expects: user_id (number), file_id (string)
     const privateFileMethods = ['getPrivateFileUrl', 'get_private_file_url']
     for (const method of privateFileMethods) {
       const fn = internal[method]
       if (typeof fn === 'function') {
         try {
-          // According to NapCat docs, only file_id is required
-          const result = await fn.call(internal, { file_id: fileId })
-          if (result?.url) {
+          // Call with positional arguments: user_id, file_id
+          const result = await fn.call(internal, userId, fileId)
+          if (result?.url && /^https?:\/\//i.test(result.url)) {
             return await fetchFromURL(result.url)
           }
-        } catch (e: any) {
-          const errMsg = e?.message || String(e)
-          if (errMsg.includes('fileUUID not found') || errMsg.includes('not found')) {
-            // File not ready, continue to next method or retry later
-            continue
-          }
-          // Try with positional argument
-          try {
-            const result = await fn.call(internal, fileId)
-            if (result?.url) {
-              return await fetchFromURL(result.url)
-            }
-          } catch {
-            continue
-          }
+        } catch {
+          // Ignore errors and try next method
+          continue
         }
       }
     }
@@ -500,7 +481,7 @@ async function fetchPrivateFile(
       if (typeof fn === 'function') {
         try {
           const result = await fn.call(internal, fileId)
-          if (result?.url) {
+          if (result?.url && /^https?:\/\//i.test(result.url)) {
             return await fetchFromURL(result.url)
           }
           if (result?.base64) {
@@ -517,23 +498,32 @@ async function fetchPrivateFile(
       }
     }
 
-    // Method 4: Try download_file
+    // Method 4: Try download_file with URL string (not object)
     const downloadMethods = ['downloadFile', 'download_file']
     for (const method of downloadMethods) {
       const fn = internal[method]
       if (typeof fn === 'function') {
-        try {
-          const result = await fn.call(internal, { file_id: fileId })
-          if (result?.file) {
-            const localBuffer = await tryReadLocalFileBuffer(result.file)
-            if (localBuffer) return localBuffer
+        // First try to get a URL from get_image, then download
+        for (const imgMethod of getImageMethods) {
+          const imgFn = internal[imgMethod]
+          if (typeof imgFn === 'function') {
+            try {
+              const imgResult = await imgFn.call(internal, { file: fileId })
+              if (imgResult?.url && /^https?:\/\//i.test(imgResult.url)) {
+                const result = await fn.call(internal, imgResult.url)
+                if (result?.file) {
+                  const localBuffer = await tryReadLocalFileBuffer(result.file)
+                  if (localBuffer) return localBuffer
+                }
+                if (result?.base64) {
+                  const buffer = bufferFromBase64(result.base64)
+                  if (buffer) return buffer
+                }
+              }
+            } catch {
+              continue
+            }
           }
-          if (result?.base64) {
-            const buffer = bufferFromBase64(result.base64)
-            if (buffer) return buffer
-          }
-        } catch {
-          continue
         }
       }
     }
