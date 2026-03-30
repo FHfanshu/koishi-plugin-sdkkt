@@ -200,57 +200,6 @@ export function makeImageSegmentKey(segment: { attrs?: Record<string, unknown>; 
 }
 
 /**
- * Simple LRU cache implementation
- */
-export class LRUCache<T> {
-    private cache: Map<string, T> = new Map();
-    private maxSize: number;
-
-    constructor(maxSize: number = 100) {
-        this.maxSize = maxSize;
-    }
-
-    get(key: string): T | undefined {
-        const item = this.cache.get(key);
-        if (item) {
-            // Refresh key
-            this.cache.delete(key);
-            this.cache.set(key, item);
-        }
-        return item;
-    }
-
-    set(key: string, value: T): void {
-        if (this.cache.has(key)) {
-            this.cache.delete(key);
-        } else if (this.cache.size >= this.maxSize) {
-            // Remove oldest item
-            const firstKey = this.cache.keys().next().value;
-            if (firstKey !== undefined) {
-                this.cache.delete(firstKey);
-            }
-        }
-        this.cache.set(key, value);
-    }
-
-    has(key: string): boolean {
-        return this.cache.has(key);
-    }
-
-    delete(key: string): boolean {
-        return this.cache.delete(key);
-    }
-
-    clear(): void {
-        this.cache.clear();
-    }
-
-    get size(): number {
-        return this.cache.size;
-    }
-}
-
-/**
  * Validation helpers
  */
 export class Validation {

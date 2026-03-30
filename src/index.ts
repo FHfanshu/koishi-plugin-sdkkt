@@ -6,7 +6,8 @@
 import { Schema, h } from 'koishi';
 import { extractMetadata, formatMetadataResult } from './extractor';
 import { fetchImage } from './fetcher';
-import { LRUCache, makeImageSegmentKey } from './utils';
+import { makeImageSegmentKey } from './utils';
+import { extendDatabase, findByCacheKey, findByPHash, saveCache, removeByCacheKey, cleanupExpired, SdCacheRecord } from './database';
 import { promises as fs } from 'fs';
 import path from 'path';
 
@@ -14,7 +15,7 @@ export const name = 'sdexif';
 
 // Optional dependency on chatluna_storage
 export const inject = {
-    required: [],
+    required: ['database'],
     optional: ['chatluna_storage']
 };
 
@@ -32,8 +33,9 @@ export interface Config {
     messageSplitThreshold: number;
     enableDedupe: boolean;
     globalDedupeEnabled: boolean;
-    globalDedupeCacheSize: number;
     globalDedupeTimeout: number;
+    imageSimilarityThreshold: number;
+    retentionDays: number;
     groupFileRetryDelay: number;
     groupFileRetryCount: number;
     privateFileRetryDelay: number;
@@ -100,12 +102,15 @@ export const Config = Schema.intersect([
         globalDedupeEnabled: Schema.boolean()
             .default(true)
             .description('是否启用跨消息去重（防止引用消息重复解析）'),
-        globalDedupeCacheSize: Schema.number()
-            .default(100)
-            .description('全局去重缓存大小（记录最近处理的图片数量）'),
         globalDedupeTimeout: Schema.number()
-            .default(300000)
-            .description('全局去重缓存超时时间（毫秒，默认5分钟）'),
+            .default(600000)
+            .description('全局去重缓存超时时间（毫秒，默认10分钟）'),
+        imageSimilarityThreshold: Schema.number()
+            .default(5)
+            .description('图片 pHash 相似度阈值（百分比，5 表示 5% 汉明距离）'),
+        retentionDays: Schema.number()
+            .default(3)
+            .description('缓存记录保留天数（默认 3 天，超时自动清理）'),
         groupFileRetryDelay: Schema.number()
             .default(2000)
             .description('群文件获取重试延迟（毫秒）- QQ群文件首次获取可能返回压缩图，需等待后重试'),
@@ -182,7 +187,35 @@ interface ImageSegment {
 
 let CACHE_DIR: string;
 let cacheDirEnsured = false;
-let globalProcessedImages: LRUCache<{ timestamp: number; channelId: string; userId?: string }> | null = null;
+
+// pHash 计算函数（延迟加载 message-dedup 的 hash 模块）
+let _calculateImageHash: ((buffer: Buffer) => Promise<string>) | null = null;
+let _calculateHashDistance: ((h1: string, h2: string) => number) | null = null;
+
+function loadHashFunctions(logger: { warn: (msg: string, ...args: unknown[]) => void }): boolean {
+    if (_calculateImageHash && _calculateHashDistance) return true;
+    try {
+        const hashModule = require('koishi-plugin-message-dedup/lib/hash');
+        _calculateImageHash = hashModule.calculateImageHash;
+        _calculateHashDistance = hashModule.calculateHashDistance;
+        return true;
+    } catch {
+        logger.warn('无法加载 message-dedup hash 模块，pHash 去重将降级为 cacheKey 匹配');
+        return false;
+    }
+}
+
+// Helper function to check if an image is globally duplicate
+function isGloballyDuplicate(
+    key: string | null,
+    cachedKeys: Map<string, number> | null,
+    timeout: number
+): boolean {
+    if (!key || !cachedKeys) return false;
+    const cachedTs = cachedKeys.get(key);
+    if (cachedTs === undefined) return false;
+    return Date.now() - cachedTs < timeout;
+}
 
 // Type definitions for Koishi context
 interface KoishiLogger {
@@ -215,12 +248,19 @@ export function apply(ctx: KoishiContext, config: Config): void {
     // Initialize cache directory path using ctx.baseDir for stability
     CACHE_DIR = path.join(ctx.baseDir, 'data', 'sdexif');
 
-    // Initialize global deduplication cache
-    if (config.globalDedupeEnabled !== false && !globalProcessedImages) {
-        const cacheSize = config.globalDedupeCacheSize ?? 100;
-        globalProcessedImages = new LRUCache(cacheSize);
-        logger.info(`全局去重缓存已初始化，大小: ${cacheSize}, 超时: ${config.globalDedupeTimeout ?? 300000}ms`);
-    }
+    // Initialize database table for image cache
+    extendDatabase(ctx as any);
+
+    // Load pHash functions from message-dedup (optional, falls back to cacheKey-only)
+    loadHashFunctions(logger);
+
+    // Periodic cleanup of expired cache records
+    const retentionMs = (config.retentionDays ?? 3) * 24 * 60 * 60 * 1000;
+    (ctx as any).setInterval(() => {
+        cleanupExpired(ctx as any, retentionMs).catch((e: unknown) => {
+            logger.warn('清理过期缓存记录失败:', e);
+        });
+    }, 60 * 60 * 1000); // 每小时清理一次
 
     // Initialize and manage cache system
     async function ensureCacheDirectory(): Promise<void> {
@@ -246,52 +286,68 @@ export function apply(ctx: KoishiContext, config: Config): void {
 
         try {
             const files = await fs.readdir(CACHE_DIR);
-            let totalSize = 0;
-            const fileStats: { path: string; size: number; mtime: Date }[] = [];
+            const fileStats = await collectFileStats(files);
+            const totalSize = fileStats.reduce((sum, f) => sum + f.size, 0);
 
-            for (const file of files) {
-                const filePath = path.join(CACHE_DIR, file);
-                try {
-                    const stat = await fs.stat(filePath);
-                    if (stat.isFile()) {
-                        totalSize += stat.size;
-                        fileStats.push({
-                            path: filePath,
-                            size: stat.size,
-                            mtime: stat.mtime
-                        });
-                    }
-                } catch {
-                    // Skip files that can't be accessed
-                }
-            }
+            if (totalSize <= config.cacheMaxSize) return;
 
-            // If total size exceeds limit, delete oldest files
-            if (totalSize > config.cacheMaxSize) {
-                logger.info(`缓存大小 ${(totalSize / 1024 / 1024).toFixed(2)}MB 超过限制 ${(config.cacheMaxSize / 1024 / 1024).toFixed(2)}MB，开始清理`);
-
-                // Sort by modification time (oldest first)
-                fileStats.sort((a, b) => a.mtime.getTime() - b.mtime.getTime());
-
-                let deletedSize = 0;
-                const targetSize = config.cacheMaxSize * 0.8; // Keep 80% of max size
-
-                for (const file of fileStats) {
-                    if (totalSize - deletedSize <= targetSize) break;
-
-                    try {
-                        await fs.unlink(file.path);
-                        deletedSize += file.size;
-                        logger.debug(`删除缓存文件: ${path.basename(file.path)} (${(file.size / 1024 / 1024).toFixed(2)}MB)`);
-                    } catch {
-                        // Skip files that can't be deleted
-                    }
-                }
-
-                logger.info(`清理完成，删除 ${(deletedSize / 1024 / 1024).toFixed(2)}MB`);
-            }
+            await cleanupFiles(fileStats, totalSize);
         } catch (e) {
             logger.warn('缓存清理失败:', e);
+        }
+    }
+
+    async function collectFileStats(files: string[]): Promise<{ path: string; size: number; mtime: Date }[]> {
+        const stats: { path: string; size: number; mtime: Date }[] = [];
+
+        for (const file of files) {
+            const stat = await safeStat(path.join(CACHE_DIR, file));
+            if (stat && stat.isFile()) {
+                stats.push({ path: path.join(CACHE_DIR, file), size: stat.size, mtime: stat.mtime });
+            }
+        }
+
+        return stats;
+    }
+
+    async function safeStat(filePath: string): Promise<{ isFile: () => boolean; size: number; mtime: Date } | null> {
+        try {
+            return await fs.stat(filePath);
+        } catch {
+            return null;
+        }
+    }
+
+    async function cleanupFiles(
+        fileStats: { path: string; size: number; mtime: Date }[],
+        totalSize: number
+    ): Promise<void> {
+        logger.info(`缓存大小 ${(totalSize / 1024 / 1024).toFixed(2)}MB 超过限制 ${(config.cacheMaxSize! / 1024 / 1024).toFixed(2)}MB，开始清理`);
+
+        fileStats.sort((a, b) => a.mtime.getTime() - b.mtime.getTime());
+
+        const targetSize = config.cacheMaxSize! * 0.8;
+        let deletedSize = 0;
+
+        for (const file of fileStats) {
+            if (totalSize - deletedSize <= targetSize) break;
+            const size = await safeDelete(file.path);
+            if (size > 0) {
+                deletedSize += file.size;
+                logger.debug(`删除缓存文件: ${path.basename(file.path)} (${(file.size / 1024 / 1024).toFixed(2)}MB)`);
+            }
+        }
+
+        logger.info(`清理完成，删除 ${(deletedSize / 1024 / 1024).toFixed(2)}MB`);
+    }
+
+    async function safeDelete(filePath: string): Promise<number> {
+        try {
+            const stat = await fs.stat(filePath);
+            await fs.unlink(filePath);
+            return stat.size;
+        } catch {
+            return 0;
         }
     }
 
@@ -357,7 +413,7 @@ export function apply(ctx: KoishiContext, config: Config): void {
 
             await ensureCacheDirectory();
 
-            const segments = await collectImageSegments(session, config.enableDebugLog, logger, config, true);
+            const segments = await collectImageSegments(session, config.enableDebugLog, logger, config, true, ctx);
             if (segments.length === 0) {
                 return '请在发送命令的同时附带图片，或引用回复包含图片的消息';
             }
@@ -395,24 +451,41 @@ export function apply(ctx: KoishiContext, config: Config): void {
 
             await ensureCacheDirectory();
 
-            const segments = await collectImageSegments(session, config.enableDebugLog, logger, config);
+            const segments = await collectImageSegments(session, config.enableDebugLog, logger, config, false, ctx);
             if (segments.length === 0) return next();
 
             const forcedConfig = { ...config, useForward: true };
             const resp = await processImages(ctx, session, segments, forcedConfig, logger, true, true);
-            await sendAutoParseResult(session, resp, target);
-
+            try {
+                await sendAutoParseResult(session, resp, target);
+            } catch (sendErr) {
+                if (config.enableDebugLog) {
+                    logger.warn('视奸转发发送失败', sendErr);
+                }
+                // Clear global cache to allow group whitelist to process
+                if (config.globalDedupeEnabled !== false && session.elements) {
+                    for (const el of session.elements) {
+                        const key = makeImageSegmentKey({ attrs: el.attrs, data: el.data });
+                        if (key) {
+                            await removeByCacheKey(ctx as any, key);
+                            if (config.enableDebugLog) {
+                                logger.info('视奸转发发送失败，清除全局缓存:', { key });
+                            }
+                        }
+                    }
+                }
+            }
             return;
         } catch (e) {
             if (config.enableDebugLog) {
                 logger.warn('视奸转发处理中发生错误', e);
             }
             // Clear global cache for images from this session to allow group whitelist to process
-            if (config.globalDedupeEnabled !== false && globalProcessedImages && session.elements) {
+            if (config.globalDedupeEnabled !== false && session.elements) {
                 for (const el of session.elements) {
                     const key = makeImageSegmentKey({ attrs: el.attrs, data: el.data });
-                    if (key && globalProcessedImages.has(key)) {
-                        globalProcessedImages.delete(key);
+                    if (key) {
+                        await removeByCacheKey(ctx as any, key);
                         if (config.enableDebugLog) {
                             logger.info('视奸转发失败，清除全局缓存:', { key });
                         }
@@ -441,7 +514,7 @@ export function apply(ctx: KoishiContext, config: Config): void {
 
             await ensureCacheDirectory();
 
-            const segments = await collectImageSegments(session, config.enableDebugLog, logger, config);
+            const segments = await collectImageSegments(session, config.enableDebugLog, logger, config, false, ctx, true);
             if (segments.length === 0) return next();
 
             const resp = await processImages(ctx, session, segments, config, logger, true, true);
@@ -470,7 +543,7 @@ export function apply(ctx: KoishiContext, config: Config): void {
 
             await ensureCacheDirectory();
 
-            const segments = await collectImageSegments(session, config.enableDebugLog, logger, config);
+            const segments = await collectImageSegments(session, config.enableDebugLog, logger, config, false, ctx, true);
             if (segments.length === 0) return next();
 
             if (config.enableDebugLog) {
@@ -552,6 +625,86 @@ function splitLongMessages(messages: string[], maxLength: number): string[] {
     return splitMessages;
 }
 
+async function processSingleImage(
+    ctx: KoishiContext,
+    session: Session,
+    segment: ImageSegment,
+    config: Config,
+    skipGlobalDedupe: boolean,
+    logger: { info: (msg: string, ...args: unknown[]) => void; warn: (msg: string, ...args: unknown[]) => void }
+): Promise<{ metadata: Record<string, unknown> } | null> {
+    const fetchResult = await fetchImage(ctx, session, segment as unknown as { type: string; attrs?: Record<string, unknown>; data?: Record<string, unknown>; _source?: string }, {
+        maxFileSize: config.maxFileSize,
+        groupFileRetryDelay: config.groupFileRetryDelay,
+        groupFileRetryCount: config.groupFileRetryCount,
+        privateFileRetryDelay: config.privateFileRetryDelay,
+        privateFileRetryCount: config.privateFileRetryCount,
+        logger,
+        debug: config.enableDebugLog,
+        chatlunaStorage: ctx.chatluna_storage
+    });
+
+    if (!fetchResult) return null;
+
+    if (config.enableDebugLog) {
+        logger.info('成功获取图片数据:', {
+            source: fetchResult.source,
+            sourceType: fetchResult.sourceType,
+            size: fetchResult.buffer.length
+        });
+    }
+
+    const metadata = extractMetadata(fetchResult.buffer, config.enableDebugLog ? logger : undefined);
+
+    if (!metadata.success || !metadata.data || Object.keys(metadata.data).length === 0) {
+        return null;
+    }
+
+    if (config.enableDebugLog) {
+        logger.info('成功提取元数据:', metadata.data);
+    }
+
+    await saveToGlobalCache(ctx, session, segment, fetchResult.buffer, skipGlobalDedupe, config, logger);
+
+    return { metadata: metadata.data as Record<string, unknown> };
+}
+
+async function saveToGlobalCache(
+    ctx: KoishiContext,
+    session: Session,
+    segment: ImageSegment,
+    buffer: Buffer,
+    skipGlobalDedupe: boolean,
+    config: Config,
+    logger: { info: (msg: string, ...args: unknown[]) => void }
+): Promise<void> {
+    if (skipGlobalDedupe || config.globalDedupeEnabled === false) return;
+
+    const key = makeImageSegmentKey({ attrs: segment.attrs, data: segment.data });
+    if (!key) return;
+
+    let pHash = '';
+    if (_calculateImageHash) {
+        try {
+            pHash = await _calculateImageHash(buffer);
+        } catch {
+            // pHash 计算失败，不影响正常解析
+        }
+    }
+
+    await saveCache(ctx as any, {
+        cacheKey: key,
+        pHash,
+        timestamp: Date.now(),
+        channelId: session.channelId || '',
+        userId: session.userId || ''
+    });
+
+    if (config.enableDebugLog) {
+        logger.info('已添加到全局去重缓存:', { key, pHash: pHash || '(无)', channelId: session.channelId });
+    }
+}
+
 async function processImages(
     ctx: KoishiContext,
     session: Session,
@@ -585,60 +738,14 @@ async function processImages(
         const segment = segments[i];
 
         if (config.enableDebugLog) {
-            logger.info(`处理第 ${i + 1} 个图片:`, {
-                type: segment.type,
-                source: segment._source
-            });
+            logger.info(`处理第 ${i + 1} 个图片:`, { type: segment.type, source: segment._source });
         }
 
         try {
-            const fetchResult = await fetchImage(ctx, session, segment as unknown as { type: string; attrs?: Record<string, unknown>; data?: Record<string, unknown>; _source?: string }, {
-                maxFileSize: config.maxFileSize,
-                groupFileRetryDelay: config.groupFileRetryDelay,
-                groupFileRetryCount: config.groupFileRetryCount,
-                privateFileRetryDelay: config.privateFileRetryDelay,
-                privateFileRetryCount: config.privateFileRetryCount,
-                logger,
-                debug: config.enableDebugLog,
-                chatlunaStorage: ctx.chatluna_storage
-            });
-
-            if (fetchResult) {
-                if (config.enableDebugLog) {
-                    logger.info('成功获取图片数据:', {
-                        source: fetchResult.source,
-                        sourceType: fetchResult.sourceType,
-                        size: fetchResult.buffer.length
-                    });
-                }
-
-                const metadata = extractMetadata(fetchResult.buffer, config.enableDebugLog ? logger : undefined);
-
-                if (metadata.success && metadata.data && Object.keys(metadata.data).length > 0) {
-                    if (config.enableDebugLog) {
-                        logger.info('成功提取元数据:', metadata.data);
-                    }
-
-                    results.push(metadata.data as Record<string, unknown>);
-                    usedSegments.push(segment);
-
-                    // Add to global deduplication cache
-                    // Skip if skipGlobalDedupe is true (e.g., when user explicitly invokes the command)
-                    if (!skipGlobalDedupe && config.globalDedupeEnabled !== false && globalProcessedImages) {
-                        const key = makeImageSegmentKey({ attrs: segment.attrs, data: segment.data });
-                        if (key) {
-                            globalProcessedImages.set(key, {
-                                timestamp: Date.now(),
-                                channelId: session.channelId || '',
-                                userId: session.userId
-                            });
-
-                            if (config.enableDebugLog) {
-                                logger.info('已添加到全局去重缓存:', { key, channelId: session.channelId });
-                            }
-                        }
-                    }
-                }
+            const result = await processSingleImage(ctx, session, segment, config, skipGlobalDedupe, logger);
+            if (result) {
+                results.push(result.metadata);
+                usedSegments.push(segment);
             }
         } catch (error) {
             logger.warn(`解析图片失败: ${(error as Error)?.message || error}`);
@@ -674,10 +781,34 @@ async function collectImageSegments(
     debug: boolean = false,
     logger: { info: (msg: string, ...args: unknown[]) => void },
     config: Config,
-    skipGlobalDedupe: boolean = false
+    skipGlobalDedupe: boolean = false,
+    ctx?: KoishiContext,
+    fileTypeOnly: boolean = false
 ): Promise<ImageSegment[]> {
     const segments: ImageSegment[] = [];
     const seenKeys = new Set<string>();
+
+    // 从数据库加载当前频道的近期缓存记录（一次性批量查询，避免逐条异步查库）
+    let cachedKeys: Map<string, number> | null = null;
+    if (!skipGlobalDedupe && config?.globalDedupeEnabled !== false) {
+        try {
+            const timeout = config?.globalDedupeTimeout ?? 600000;
+            const cutoff = Date.now() - timeout;
+            const channelId = session.channelId || '';
+            const records = await (ctx as any).database.get('sdkkt_image_cache', {
+                channelId,
+                timestamp: { $gt: cutoff }
+            });
+            if (records.length > 0) {
+                cachedKeys = new Map();
+                for (const r of records) {
+                    cachedKeys.set(r.cacheKey, r.timestamp);
+                }
+            }
+        } catch {
+            // DB 查询失败不影响正常流程，仅跳过去重
+        }
+    }
 
     if (debug) {
         logger.info('collectImageSegments 开始:', {
@@ -686,7 +817,7 @@ async function collectImageSegments(
             quoteMessage: session.quote?.message ? 'exists' : 'none',
             quoteContent: session.quote?.content ? 'exists' : 'none',
             globalDedupeEnabled: config?.globalDedupeEnabled !== false,
-            globalCacheSize: globalProcessedImages?.size || 0
+            cachedRecordsLoaded: cachedKeys?.size || 0
         });
     }
 
@@ -711,6 +842,15 @@ async function collectImageSegments(
         }
 
         if (!isImage) return;
+
+        // 自动解析模式：仅处理文件类型图片（file/attachment），普通 image 元素需通过指令触发
+        const isFileType = raw.type === 'file' || raw.type === 'attachment';
+        if (fileTypeOnly && !isFileType) {
+            if (debug && logger) {
+                logger.info('自动解析：跳过非文件类型图片', { type: raw.type, origin });
+            }
+            return;
+        }
 
         if (debug && logger) {
             const a = raw.attrs || {};
@@ -745,26 +885,17 @@ async function collectImageSegments(
         }
 
         // Global dedupe: across messages (e.g., quoted images)
-        // Skip global dedupe when user explicitly invokes the command (skipGlobalDedupe=true)
-        if (!skipGlobalDedupe && key && config?.globalDedupeEnabled !== false && globalProcessedImages) {
-            const cached = globalProcessedImages.get(key);
-            if (cached) {
-                const timeout = config?.globalDedupeTimeout ?? 300000;
-                const elapsed = Date.now() - cached.timestamp;
-                if (elapsed < timeout) {
-                    if (debug && logger) {
-                        logger.info('去重：忽略重复图片元素（全局）', {
-                            origin,
-                            key,
-                            elapsedMs: elapsed,
-                            previousChannel: cached.channelId,
-                            currentChannel: session.channelId
-                        });
-                    }
-                    return;
-                }
-                // Expired, will be overwritten
+        if (isGloballyDuplicate(key, cachedKeys, config?.globalDedupeTimeout ?? 600000)) {
+            if (debug && logger) {
+                const elapsed = Date.now() - (cachedKeys?.get(key!) ?? 0);
+                logger.info('去重：忽略重复图片元素（全局）', {
+                    origin,
+                    key,
+                    elapsedMs: elapsed,
+                    currentChannel: session.channelId
+                });
             }
+            return;
         }
 
         if (key) seenKeys.add(key);
@@ -870,91 +1001,125 @@ async function fetchQuotedMessage(
     const bot = session.bot;
     if (!bot) return;
 
-    if (typeof bot.getMessage === 'function') {
+    await tryFetchFromBotGetMessage(bot, session, quoteId, traverse);
+    await tryFetchFromOneBotInternal(bot, session, quoteId, traverse);
+}
+
+async function tryFetchFromBotGetMessage(
+    bot: any,
+    session: Session,
+    quoteId: string,
+    traverse: (raw: unknown, origin: string) => void
+): Promise<void> {
+    if (typeof bot.getMessage !== 'function') return;
+
+    try {
+        let quoted: { elements?: h[]; message?: unknown[]; content?: string } | null = null;
+
         try {
-            let quoted: { elements?: h[]; message?: unknown[]; content?: string } | null = null;
-
-            try {
-                quoted = await bot.getMessage(session.channelId || '', quoteId);
-            } catch {
-                if (bot.getMessageOne) {
-                    quoted = await bot.getMessageOne(quoteId);
-                }
-            }
-
-            if (quoted) {
-                const elems = Array.isArray(quoted.elements) ? quoted.elements : (Array.isArray(quoted.message) ? quoted.message : []);
-                elems.forEach((el, index) => traverse(el, `bot.getMessage[${index}]`));
-
-                if (typeof quoted.content === 'string') {
-                    const parsed = h.parse(quoted.content);
-                    const arr = Array.isArray(parsed) ? parsed : [parsed];
-                    arr.forEach((el, index) => traverse(el, `bot.getMessage.content[${index}]`));
-                }
-            }
+            quoted = await bot.getMessage(session.channelId || '', quoteId);
         } catch {
-            // Ignore errors
+            if (bot.getMessageOne) {
+                quoted = await bot.getMessageOne(quoteId);
+            }
+        }
+
+        if (!quoted) return;
+
+        const elems = Array.isArray(quoted.elements) ? quoted.elements : (Array.isArray(quoted.message) ? quoted.message : []);
+        elems.forEach((el, index) => traverse(el, `bot.getMessage[${index}]`));
+
+        if (typeof quoted.content === 'string') {
+            const parsed = h.parse(quoted.content);
+            const arr = Array.isArray(parsed) ? parsed : [parsed];
+            arr.forEach((el, index) => traverse(el, `bot.getMessage.content[${index}]`));
+        }
+    } catch {
+        // Ignore errors
+    }
+}
+
+async function tryFetchFromOneBotInternal(
+    bot: any,
+    session: Session,
+    quoteId: string,
+    traverse: (raw: unknown, origin: string) => void
+): Promise<void> {
+    if (session.platform !== 'onebot' || !bot.internal) return;
+
+    const internal = bot.internal;
+    const methods = ['getMsg', 'get_msg'];
+
+    for (const method of methods) {
+        const fn = internal[method];
+        if (typeof fn !== 'function') continue;
+
+        try {
+            const ret = await (fn as (id: string) => Promise<{ message?: unknown[]; data?: { message?: unknown[] } }>)(quoteId);
+            const msg = ret?.message || ret?.data?.message;
+
+            if (!Array.isArray(msg)) continue;
+
+            processOneBotMessageSegments(msg, traverse);
+            return;
+        } catch {
+            continue;
         }
     }
+}
 
-    if ((session.platform === 'onebot') && bot.internal) {
-        try {
-            const internal = bot.internal;
-            const methods = ['getMsg', 'get_msg'];
+function processOneBotMessageSegments(
+    msg: unknown[],
+    traverse: (raw: unknown, origin: string) => void
+): void {
+    msg.forEach((seg, index) => {
+        const segObj = seg as { type?: string; data?: Record<string, unknown> };
 
-            for (const method of methods) {
-                const fn = internal[method];
-                if (typeof fn === 'function') {
-                    try {
-                        const ret = await (fn as (id: string) => Promise<{ message?: unknown[]; data?: { message?: unknown[] } }>)(
-                            quoteId
-                        );
-                        const msg = ret?.message || ret?.data?.message;
-
-                        if (Array.isArray(msg)) {
-                            msg.forEach((seg, index) => {
-                                const segObj = seg as { type?: string; data?: Record<string, unknown> };
-                                if (segObj?.type === 'image' || segObj?.type === 'img') {
-                                    const d = segObj.data || {};
-                                    const attrs = {
-                                        url: d.url || d.file_url,
-                                        file: d.file || d.filename,
-                                        fileId: d.file || d.file_id || d.id,
-                                        src: d.url || d.file || d.filename
-                                    };
-                                    traverse({ type: 'image', attrs, data: attrs }, `onebot.internal[${index}]`);
-                                } else if (segObj?.type === 'file') {
-                                    // Handle file segments (e.g., group file uploads)
-                                    const d = segObj.data || {};
-                                    const name = (d.name || d.file || '') as string;
-                                    const fileExt = path.extname(name).toLowerCase();
-                                    const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.heic', '.heif'];
-
-                                    if (imageExts.includes(fileExt)) {
-                                        const attrs = {
-                                            url: d.url || d.file_url,
-                                            file: d.file || d.file_id || d.id,
-                                            fileId: d.file || d.file_id || d.id,
-                                            name: d.name,
-                                            size: d.size || d.file_size,
-                                            busid: d.busid,
-                                            src: d.url || d.file
-                                        };
-                                        traverse({ type: 'file', attrs, data: attrs }, `onebot.internal.file[${index}]`);
-                                    }
-                                }
-                            });
-                            return;
-                        }
-                    } catch {
-                        continue;
-                    }
-                }
-            }
-        } catch {
-            // Ignore errors
+        if (segObj?.type === 'image' || segObj?.type === 'img') {
+            processOneBotImageSegment(segObj, index, traverse);
+        } else if (segObj?.type === 'file') {
+            processOneBotFileSegment(segObj, index, traverse);
         }
-    }
+    });
+}
+
+function processOneBotImageSegment(
+    segObj: { type?: string; data?: Record<string, unknown> },
+    index: number,
+    traverse: (raw: unknown, origin: string) => void
+): void {
+    const d = segObj.data || {};
+    const attrs = {
+        url: d.url || d.file_url,
+        file: d.file || d.filename,
+        fileId: d.file || d.file_id || d.id,
+        src: d.url || d.file || d.filename
+    };
+    traverse({ type: 'image', attrs, data: attrs }, `onebot.internal[${index}]`);
+}
+
+function processOneBotFileSegment(
+    segObj: { type?: string; data?: Record<string, unknown> },
+    index: number,
+    traverse: (raw: unknown, origin: string) => void
+): void {
+    const d = segObj.data || {};
+    const name = (d.name || d.file || '') as string;
+    const fileExt = path.extname(name).toLowerCase();
+    const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.heic', '.heif'];
+
+    if (!imageExts.includes(fileExt)) return;
+
+    const attrs = {
+        url: d.url || d.file_url,
+        file: d.file || d.file_id || d.id,
+        fileId: d.file || d.file_id || d.id,
+        name: d.name,
+        size: d.size || d.file_size,
+        busid: d.busid,
+        src: d.url || d.file
+    };
+    traverse({ type: 'file', attrs, data: attrs }, `onebot.internal.file[${index}]`);
 }
 
 /**

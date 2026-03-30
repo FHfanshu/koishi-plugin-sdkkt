@@ -22,7 +22,9 @@
       "en": "Read Stable Diffusion info from images"
     },
     "service": {
-      "required": [],
+      "required": [
+        "database"
+      ],
       "optional": [
         "chatluna_storage"
       ]
