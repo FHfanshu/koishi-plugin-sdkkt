@@ -1,0 +1,47 @@
+{
+  "name": "koishi-plugin-sdkkt",
+  "version": "0.2.28",
+  "description": "Patched version of sdexif with OneBot file API support for Docker environments",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin",
+    "stable-diffusion",
+    "exif",
+    "png-info"
+  ],
+  "koishi": {
+    "description": {
+      "zh": "读取图片中的 Stable Diffusion 信息",
+      "en": "Read Stable Diffusion info from images"
+    },
+    "service": {
+      "required": [],
+      "optional": [
+        "chatluna_storage"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "koishi": "^4.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "exifreader": "^4.23.0",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "koishi": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "scripts": {
+    "build": "tsc"
+  }
+}
