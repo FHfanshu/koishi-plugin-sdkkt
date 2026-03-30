@@ -183,6 +183,7 @@ interface ImageSegment {
     attrs: Record<string, unknown>;
     data: Record<string, unknown>;
     _source: string;
+    buffer?: Buffer;
 }
 
 let CACHE_DIR: string;
@@ -632,7 +633,7 @@ async function processSingleImage(
     config: Config,
     skipGlobalDedupe: boolean,
     logger: { info: (msg: string, ...args: unknown[]) => void; warn: (msg: string, ...args: unknown[]) => void }
-): Promise<{ metadata: Record<string, unknown> } | null> {
+): Promise<{ metadata: Record<string, unknown>; buffer: Buffer } | null> {
     const fetchResult = await fetchImage(ctx, session, segment as unknown as { type: string; attrs?: Record<string, unknown>; data?: Record<string, unknown>; _source?: string }, {
         maxFileSize: config.maxFileSize,
         groupFileRetryDelay: config.groupFileRetryDelay,
@@ -666,7 +667,7 @@ async function processSingleImage(
 
     await saveToGlobalCache(ctx, session, segment, fetchResult.buffer, skipGlobalDedupe, config, logger);
 
-    return { metadata: metadata.data as Record<string, unknown> };
+    return { metadata: metadata.data as Record<string, unknown>, buffer: fetchResult.buffer };
 }
 
 async function saveToGlobalCache(
@@ -745,7 +746,7 @@ async function processImages(
             const result = await processSingleImage(ctx, session, segment, config, skipGlobalDedupe, logger);
             if (result) {
                 results.push(result.metadata);
-                usedSegments.push(segment);
+                usedSegments.push({ ...segment, buffer: result.buffer });
             }
         } catch (error) {
             logger.warn(`解析图片失败: ${(error as Error)?.message || error}`);
@@ -1179,13 +1180,13 @@ function formatForwardModeOutput(
         const imageSeg = imageSegments[index];
         const hasImage = !!(imageSeg && (imageSeg.attrs?.url || imageSeg.attrs?.src || imageSeg.data?.url || imageSeg.data?.src));
 
-        // If we have an image URL and withImage is enabled
+        // If we have an image and withImage is enabled
         if (hasImage && withImage) {
-            const imageUrl = imageSeg.attrs?.url || imageSeg.attrs?.src || imageSeg.data?.url || imageSeg.data?.src;
+            const imageContent = buildImageContent(imageSeg);
             return h('message', {}, [
                 h('author', { id: selfId, name: displayName }),
                 h('content', {}, [
-                    h.image(imageUrl as string),
+                    imageContent,
                     msg
                 ])
             ]);
@@ -1199,6 +1200,52 @@ function formatForwardModeOutput(
     });
 
     return [h('message', { forward: true }, nodes)];
+}
+
+/**
+ * Build image content element from segment, preferring buffer data
+ */
+function buildImageContent(imageSeg: ImageSegment): h {
+    // Prefer buffer data if available (for OneBot compatibility)
+    if (imageSeg.buffer && imageSeg.buffer.length > 0) {
+        const base64 = imageSeg.buffer.toString('base64');
+        const mime = detectImageMime(imageSeg.buffer) || 'image/png';
+        return h.image(`data:${mime};base64,${base64}`);
+    }
+
+    // Fall back to URL
+    const imageUrl = imageSeg.attrs?.url || imageSeg.attrs?.src || imageSeg.data?.url || imageSeg.data?.src;
+    return h.image(imageUrl as string);
+}
+
+/**
+ * Detect image MIME type from buffer magic bytes
+ */
+function detectImageMime(buffer: Buffer): string | null {
+    if (buffer.length < 8) return null;
+
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) {
+        return 'image/png';
+    }
+
+    // JPEG: FF D8 FF
+    if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) {
+        return 'image/jpeg';
+    }
+
+    // WebP: RIFF....WEBP
+    if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+        buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) {
+        return 'image/webp';
+    }
+
+    // GIF: GIF87a or GIF89a
+    if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) {
+        return 'image/gif';
+    }
+
+    return null;
 }
 
 /**
