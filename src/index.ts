@@ -1144,16 +1144,21 @@ function formatNormalModeOutput(
 
     messages.forEach((msg, index) => {
         const imageSeg = imageSegments[index];
-        const hasImage = imageSeg !== undefined && imageSeg.attrs?.url !== undefined;
+        const hasImage = !!(imageSeg && (
+            imageSeg.buffer?.length ||
+            imageSeg.attrs?.url ||
+            imageSeg.attrs?.src ||
+            imageSeg.data?.url ||
+            imageSeg.data?.src
+        ));
 
         // Add image if available and supported
         if (hasImage && supportsFile) {
-            const imageUrl = imageSeg.attrs?.url;
             // Add separator between images if not the first one
             if (results.length > 0) {
                 results.push('\n\n===\n\n');
             }
-            results.push(h.image(imageUrl as string));
+            results.push(buildImageContent(imageSeg));
             results.push('\n\n');
         }
         // Add the message content
